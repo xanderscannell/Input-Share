@@ -1,0 +1,72 @@
+# Build directories
+build/
+out/
+x64/
+x86/
+Release/
+Debug/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Visual Studio files
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.exp
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+```
+
+---
+
+## Final Project Structure
+```
+mouse-share-win/
+├── .gitignore
+├── CMakeLists.txt
+├── README.md
+├── build.bat
+├── common.hpp
+├── network.hpp
+├── input_capture.hpp
+├── input_simulator.hpp
+├── server.cpp
+├── client.cpp
+└── gui_app.cpp
