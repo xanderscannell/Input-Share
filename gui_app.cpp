@@ -481,11 +481,36 @@ void server_thread_func() {
         },
         // Keyboard
         [](uint32_t vk, uint32_t scan, uint32_t flags, bool pressed) {
+            // F8 to manually toggle input control (for testing)
+            if (vk == VK_F8 && pressed) {
+                std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                if (g_app.active_client.is_valid()) {
+                    g_app.active_on_remote = !g_app.active_on_remote;
+                    g_app.input_capture.capture_input(g_app.active_on_remote);
+
+                    const char* msg = g_app.active_on_remote ?
+                        "F8: Switched to REMOTE control" :
+                        "F8: Switched to LOCAL control";
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
+
+                    if (g_app.active_on_remote) {
+                        // Send switch event to remote
+                        SwitchScreenEvent event;
+                        event.edge = ScreenEdge::LEFT;
+                        event.position = GetSystemMetrics(SM_CYSCREEN) / 2;
+                        auto data = serialize_packet(EventType::SWITCH_SCREEN, event);
+                        g_app.active_client.send(data);
+                    }
+                }
+                return;
+            }
+
             // Scroll Lock to toggle
             if (vk == VK_SCROLL && pressed) {
                 if (g_app.active_on_remote) {
                     g_app.active_on_remote = false;
                     g_app.input_capture.capture_input(false);
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"ScrollLock: Switched to LOCAL control");
                 }
                 return;
             }
@@ -503,6 +528,7 @@ void server_thread_func() {
             if (sent <= 0) {
                 g_app.active_on_remote = false;
                 g_app.input_capture.capture_input(false);
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Connection lost - switched to LOCAL control");
             }
         }
     );
@@ -514,7 +540,9 @@ void server_thread_func() {
         g_app.server_socket.bind(g_app.port);
         g_app.server_socket.listen();
         
-        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Server started");
+        static char start_msg[256];
+        snprintf(start_msg, sizeof(start_msg), "SERVER STARTED - Waiting for client connection on port %d", (int)g_app.port);
+        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)start_msg);
         
         while (g_app.server_running) {
             // Accept with timeout
@@ -538,7 +566,7 @@ void server_thread_func() {
                     g_app.active_client.send(data);
                 }
 
-                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client connected");
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"CLIENT CONNECTED! Press F8 to toggle control, or move mouse to screen edge");
 
                 // Keep connection alive
                 while (g_app.server_running) {
@@ -555,6 +583,8 @@ void server_thread_func() {
                 }
                 g_app.active_on_remote = false;
                 g_app.input_capture.capture_input(false);
+
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client disconnected - waiting for new connection...");
             }
         }
     } catch (const NetworkError& e) {
@@ -577,7 +607,7 @@ void client_thread_func(std::string host, uint16_t port) {
         g_app.client_connected = true;
         g_app.connected_to = host;
         
-        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Connected to server");
+        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"CONNECTED TO SERVER! Press F8 to toggle control, or move mouse to screen edge");
         
         int cursor_x = 0, cursor_y = 0;
         bool active = false;
@@ -804,8 +834,21 @@ void draw_layout(HDC hdc, RECT& rect) {
     
     // Instructions
     SetTextColor(hdc, RGB(100, 100, 100));
-    const char* instructions = "Drag monitors to arrange. Click to select.";
-    TextOutA(hdc, 10, rect.bottom - 25, instructions, (int)strlen(instructions));
+    std::string instructions = "Drag monitors to arrange. ";
+    if (g_app.server_running || g_app.client_connected) {
+        instructions += "Press F8 to manually toggle control. ";
+    }
+    if (g_app.server_running) {
+        bool has_client = false;
+        {
+            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+            has_client = g_app.active_client.is_valid();
+        }
+        instructions += has_client ? "Client is CONNECTED" : "Waiting for client...";
+    } else if (g_app.client_connected) {
+        instructions += g_app.active_on_remote ? "Controlling REMOTE" : "Controlling LOCAL";
+    }
+    TextOutA(hdc, 10, rect.bottom - 25, instructions.c_str(), (int)instructions.length());
 }
 
 int hit_test_layout(int mouse_x, int mouse_y) {
@@ -960,7 +1003,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 WS_EX_CLIENTEDGE,
                 WC_LISTVIEWA, "",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                520, 10, 260, 200,
+                520, 10, 360, 200,
                 hwnd, (HMENU)(INT_PTR)ID_LISTVIEW_COMPUTERS, GetModuleHandle(nullptr), nullptr
             );
             
@@ -971,32 +1014,36 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             LVCOLUMNA col = {};
             col.mask = LVCF_TEXT | LVCF_WIDTH;
             col.pszText = (LPSTR)"Computer";
-            col.cx = 120;
+            col.cx = 100;
             SendMessageA(g_app.hwnd_list, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
-            
+
             col.pszText = (LPSTR)"IP Address";
             col.cx = 100;
             SendMessageA(g_app.hwnd_list, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+
+            col.pszText = (LPSTR)"Status";
+            col.cx = 140;
+            SendMessageA(g_app.hwnd_list, LVM_INSERTCOLUMNA, 2, (LPARAM)&col);
             
             // Create buttons
             CreateWindowA("BUTTON", "Start Server",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                520, 220, 125, 30,
+                520, 220, 170, 30,
                 hwnd, (HMENU)(INT_PTR)ID_BTN_START_SERVER, GetModuleHandle(nullptr), nullptr);
-            
+
             CreateWindowA("BUTTON", "Stop Server",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                655, 220, 125, 30,
+                700, 220, 170, 30,
                 hwnd, (HMENU)(INT_PTR)ID_BTN_STOP_SERVER, GetModuleHandle(nullptr), nullptr);
-            
+
             CreateWindowA("BUTTON", "Connect",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                520, 260, 125, 30,
+                520, 260, 170, 30,
                 hwnd, (HMENU)(INT_PTR)ID_BTN_CONNECT, GetModuleHandle(nullptr), nullptr);
-            
+
             CreateWindowA("BUTTON", "Disconnect",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                655, 260, 125, 30,
+                700, 260, 170, 30,
                 hwnd, (HMENU)(INT_PTR)ID_BTN_DISCONNECT, GetModuleHandle(nullptr), nullptr);
             
             // Labels and edit controls
@@ -1044,27 +1091,61 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             if (wParam == TIMER_UPDATE) {
                 // Update computer list
                 std::lock_guard<std::mutex> lock(g_app.layout_mutex);
-                
+
                 SendMessageA(g_app.hwnd_list, LVM_DELETEALLITEMS, 0, 0);
-                
+
                 for (size_t i = 0; i < g_app.layout.computers.size(); i++) {
                     const auto& comp = g_app.layout.computers[i];
-                    if (comp.name == g_app.computer_name) continue;
-                    
+
+                    // Add computer name
                     LVITEMA item = {};
                     item.mask = LVIF_TEXT;
                     item.iItem = (int)i;
                     item.pszText = (LPSTR)comp.name.c_str();
                     int idx = (int)SendMessageA(g_app.hwnd_list, LVM_INSERTITEMA, 0, (LPARAM)&item);
-                    
+
+                    // Add IP address
                     LVITEMA subitem = {};
                     subitem.mask = LVIF_TEXT;
                     subitem.iItem = idx;
                     subitem.iSubItem = 1;
                     subitem.pszText = (LPSTR)comp.ip.c_str();
                     SendMessageA(g_app.hwnd_list, LVM_SETITEMA, 0, (LPARAM)&subitem);
+
+                    // Add status
+                    std::string status;
+                    if (comp.name == g_app.computer_name) {
+                        if (g_app.server_running) {
+                            bool has_client = false;
+                            bool controlling_remote = false;
+                            {
+                                std::lock_guard<std::mutex> client_lock(g_app.active_client_mutex);
+                                has_client = g_app.active_client.is_valid();
+                                controlling_remote = g_app.active_on_remote;
+                            }
+                            if (has_client) {
+                                status = controlling_remote ? "Server [SENDING]" : "Server [READY]";
+                            } else {
+                                status = "Server";
+                            }
+                        } else if (g_app.client_connected) {
+                            status = g_app.active_on_remote ? "Client [RECEIVING]" : "Client [READY]";
+                        } else {
+                            status = "This PC";
+                        }
+                    } else {
+                        if (comp.is_connected) {
+                            status = "Connected";
+                        } else {
+                            status = "Available";
+                        }
+                    }
+
+                    subitem.iSubItem = 2;
+                    subitem.pszText = (LPSTR)status.c_str();
+                    SendMessageA(g_app.hwnd_list, LVM_SETITEMA, 0, (LPARAM)&subitem);
                 }
-                
+
                 InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
             }
             return 0;
@@ -1315,7 +1396,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         "MouseShareMain",
         "MouseShare - Share Mouse & Keyboard",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 420,
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 420,
         nullptr, nullptr, hInstance, nullptr
     );
     
