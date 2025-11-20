@@ -511,9 +511,23 @@ void server_thread_func() {
                     // Call capture_input WITHOUT holding any lock
                     g_app.input_capture.capture_input(new_state);
 
-                    const char* msg = new_state ?
-                        "F8: Switched to REMOTE control" :
-                        "F8: Switched to LOCAL control";
+                    // Check if we have a connected neighbor for diagnostics
+                    int connected_count = 0;
+                    {
+                        std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+                        for (const auto& comp : g_app.layout.computers) {
+                            if (comp.name != g_app.computer_name && comp.is_connected) {
+                                connected_count++;
+                            }
+                        }
+                    }
+
+                    static char msg[256];
+                    if (new_state) {
+                        snprintf(msg, sizeof(msg), "F8: Switched to REMOTE control (%d connected computers found)", connected_count);
+                    } else {
+                        snprintf(msg, sizeof(msg), "F8: Switched to LOCAL control");
+                    }
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
 
                     if (new_state) {
@@ -525,7 +539,10 @@ void server_thread_func() {
 
                         std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
                         if (g_app.active_client.is_valid()) {
-                            g_app.active_client.send(data);
+                            int sent = g_app.active_client.send(data);
+                            if (sent <= 0) {
+                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Failed to send SWITCH_SCREEN to client!");
+                            }
                         }
                     }
                 }
@@ -586,6 +603,24 @@ void server_thread_func() {
             if (select(0, &readSet, nullptr, nullptr, &tv) > 0) {
                 Socket new_client = g_app.server_socket.accept();
 
+                // Get client address to find which computer connected
+                sockaddr_in client_addr{};
+                int addr_len = sizeof(client_addr);
+                getpeername(new_client.handle(), (sockaddr*)&client_addr, &addr_len);
+                char client_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+
+                // Mark the client computer as connected in our layout
+                {
+                    std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+                    for (auto& comp : g_app.layout.computers) {
+                        if (comp.ip == client_ip) {
+                            comp.is_connected = true;
+                            break;
+                        }
+                    }
+                }
+
                 {
                     std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
                     g_app.active_client = std::move(new_client);
@@ -598,7 +633,9 @@ void server_thread_func() {
                     g_app.active_client.send(data);
                 }
 
-                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"CLIENT CONNECTED! Press F8 to toggle control, or move mouse to screen edge");
+                static char conn_msg[256];
+                snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
 
                 // Keep connection alive
                 while (g_app.server_running) {
@@ -607,6 +644,17 @@ void server_thread_func() {
                         if (!g_app.active_client.is_valid()) break;
                     }
                     Sleep(100);
+                }
+
+                // Mark client as disconnected
+                {
+                    std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+                    for (auto& comp : g_app.layout.computers) {
+                        if (comp.ip == client_ip) {
+                            comp.is_connected = false;
+                            break;
+                        }
+                    }
                 }
 
                 {
@@ -1382,11 +1430,24 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         
         case WM_DESTROY: {
-            // Cleanup
+            // Cleanup - stop all threads and close all sockets
             g_app.discovery_running = false;
             g_app.server_running = false;
             g_app.client_connected = false;
-            
+
+            // Stop input capture
+            g_app.input_capture.stop();
+
+            // Close all sockets to unblock threads
+            g_app.server_socket.close();
+            g_app.client_socket.close();
+            {
+                std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                g_app.active_client.close();
+            }
+            g_app.discovery_socket.close();
+
+            // Wait for threads with timeout
             if (g_app.discovery_thread.joinable()) {
                 g_app.discovery_thread.join();
             }
@@ -1396,14 +1457,14 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             if (g_app.client_thread && g_app.client_thread->joinable()) {
                 g_app.client_thread->join();
             }
-            
+
             // Remove tray icon
             NOTIFYICONDATAA nid = {};
             nid.cbSize = sizeof(nid);
             nid.hWnd = hwnd;
             nid.uID = ID_TRAY_ICON;
             Shell_NotifyIconA(NIM_DELETE, &nid);
-            
+
             PostQuitMessage(0);
             return 0;
         }
