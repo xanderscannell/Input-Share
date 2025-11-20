@@ -415,7 +415,7 @@ void server_thread_func() {
             if (at_edge && !g_app.active_on_remote) {
                 // Switch to client
                 g_app.active_on_remote = true;
-                g_app.input_capture.capture_input(true);
+                // DON'T call capture_input - let cursor move naturally to generate dx/dy
 
                 SwitchScreenEvent event;
                 // Send the opposite edge for client entry
@@ -435,15 +435,12 @@ void server_thread_func() {
                         if (sent <= 0) {
                             // Send failed - disconnect
                             g_app.active_on_remote = false;
-                            g_app.input_capture.capture_input(false);
                             return;
                         }
                     }
                 }
 
-                // Move cursor away from edge
-                g_app.input_capture.warp_cursor(g_app.local_info.screen_width / 2,
-                                               g_app.local_info.screen_height / 2);
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Edge detected - now controlling remote");
             } else if (g_app.active_on_remote) {
                 MouseMoveEvent event;
                 event.x = x;
@@ -460,7 +457,6 @@ void server_thread_func() {
                         if (sent <= 0) {
                             // Send failed - disconnect
                             g_app.active_on_remote = false;
-                            g_app.input_capture.capture_input(false);
                         }
                     }
                 }
@@ -479,7 +475,6 @@ void server_thread_func() {
             int sent = g_app.active_client.send(data);
             if (sent <= 0) {
                 g_app.active_on_remote = false;
-                g_app.input_capture.capture_input(false);
             }
         },
         // Mouse scroll
@@ -495,7 +490,6 @@ void server_thread_func() {
             int sent = g_app.active_client.send(data);
             if (sent <= 0) {
                 g_app.active_on_remote = false;
-                g_app.input_capture.capture_input(false);
             }
         },
         // Keyboard
@@ -509,8 +503,8 @@ void server_thread_func() {
                     g_app.active_on_remote = !g_app.active_on_remote;
                     bool new_state = g_app.active_on_remote;
 
-                    // Call capture_input WITHOUT holding any lock
-                    g_app.input_capture.capture_input(new_state);
+                    // DON'T call capture_input - we need real dx/dy values
+                    // The hook will still send movements to remote when active_on_remote is true
 
                     // Check if we have a connected neighbor for diagnostics
                     int connected_count = 0;
@@ -525,9 +519,9 @@ void server_thread_func() {
 
                     static char msg[256];
                     if (new_state) {
-                        snprintf(msg, sizeof(msg), "F8: Switched to REMOTE control (%d connected computers found)", connected_count);
+                        snprintf(msg, sizeof(msg), "F8: REMOTE control - Server cursor will move, client mirrors (%d connected)", connected_count);
                     } else {
-                        snprintf(msg, sizeof(msg), "F8: Switched to LOCAL control");
+                        snprintf(msg, sizeof(msg), "F8: LOCAL control - Back to normal");
                     }
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
 
@@ -543,6 +537,8 @@ void server_thread_func() {
                             int sent = g_app.active_client.send(data);
                             if (sent <= 0) {
                                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Failed to send SWITCH_SCREEN to client!");
+                            } else {
+                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: SWITCH_SCREEN sent! Move server mouse to test.");
                             }
                         }
                     }
@@ -550,11 +546,10 @@ void server_thread_func() {
                 return;
             }
 
-            // Scroll Lock to toggle
+            // Scroll Lock to toggle back to local
             if (vk == VK_SCROLL && pressed) {
                 if (g_app.active_on_remote) {
                     g_app.active_on_remote = false;
-                    g_app.input_capture.capture_input(false);
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"ScrollLock: Switched to LOCAL control");
                 }
                 return;
@@ -575,7 +570,6 @@ void server_thread_func() {
                     int sent = g_app.active_client.send(data);
                     if (sent <= 0) {
                         g_app.active_on_remote = false;
-                        g_app.input_capture.capture_input(false);
                         PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Connection lost - switched to LOCAL control");
                     }
                 }
@@ -683,7 +677,6 @@ void server_thread_func() {
                     g_app.active_client.close();
                 }
                 g_app.active_on_remote = false;
-                g_app.input_capture.capture_input(false);
 
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client disconnected - waiting for new connection...");
             }
