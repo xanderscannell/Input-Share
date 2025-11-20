@@ -111,6 +111,7 @@ public:
     // Network state
     std::atomic<bool> server_running{false};
     std::atomic<bool> client_connected{false};
+    std::atomic<bool> client_is_receiving{false};  // Track if client is actively receiving input
     std::string connected_to;
     
     // Screen layout
@@ -637,12 +638,31 @@ void server_thread_func() {
                 snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
 
-                // Keep connection alive
+                // Keep connection alive and detect disconnect
                 while (g_app.server_running) {
+                    bool still_connected = false;
                     {
                         std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
                         if (!g_app.active_client.is_valid()) break;
+
+                        // Check if client is still connected by trying to peek
+                        char peek_buf[1];
+                        int peek_result = recv(g_app.active_client.handle(), peek_buf, 1, MSG_PEEK);
+
+                        if (peek_result == 0) {
+                            // Connection closed gracefully
+                            break;
+                        } else if (peek_result < 0) {
+                            int err = WSAGetLastError();
+                            if (err != WSAEWOULDBLOCK) {
+                                // Connection error
+                                break;
+                            }
+                        }
+                        still_connected = true;
                     }
+
+                    if (!still_connected) break;
                     Sleep(100);
                 }
 
@@ -743,10 +763,12 @@ void client_thread_func(std::string host, uint16_t port) {
 
                     if (should_return) {
                         active = false;
+                        g_app.client_is_receiving = false;  // Update global state
                         // Move cursor to center to prevent re-trigger
                         cursor_x = g_app.local_info.screen_width / 2;
                         cursor_y = g_app.local_info.screen_height / 2;
                         g_app.input_simulator.move_mouse(cursor_x, cursor_y);
+                        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client returned control to server");
                     }
                     break;
                 }
@@ -781,6 +803,7 @@ void client_thread_func(std::string host, uint16_t port) {
 
                     auto* e = (SwitchScreenEvent*)payload.data();
                     active = true;
+                    g_app.client_is_receiving = true;  // Update global state for GUI
                     entry_edge = e->edge;
 
                     // Position cursor based on entry edge
@@ -811,6 +834,8 @@ void client_thread_func(std::string host, uint16_t port) {
                     cursor_x = (std::max)(0, (std::min)(cursor_x, g_app.local_info.screen_width - 1));
                     cursor_y = (std::max)(0, (std::min)(cursor_y, g_app.local_info.screen_height - 1));
                     g_app.input_simulator.move_mouse(cursor_x, cursor_y);
+
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client now RECEIVING input from server");
                     break;
                 }
                 default:
@@ -820,9 +845,10 @@ void client_thread_func(std::string host, uint16_t port) {
     } catch (const NetworkError& e) {
         PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)e.what());
     }
-    
+
     g_app.client_socket.close();
     g_app.client_connected = false;
+    g_app.client_is_receiving = false;  // Reset receiving state
     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Disconnected");
 }
 
@@ -1222,7 +1248,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                                 status = "Server";
                             }
                         } else if (g_app.client_connected) {
-                            status = g_app.active_on_remote ? "Client [RECEIVING]" : "Client [READY]";
+                            status = g_app.client_is_receiving ? "Client [RECEIVING]" : "Client [READY]";
                         } else {
                             status = "This PC";
                         }
@@ -1424,8 +1450,22 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         
         case WM_CLOSE: {
-            // Minimize to tray instead of closing
-            ShowWindow(hwnd, SW_HIDE);
+            // Ask user if they want to exit or minimize to tray
+            int result = MessageBoxA(hwnd,
+                "Do you want to exit MouseShare?\n\n"
+                "Yes - Exit the application\n"
+                "No - Minimize to system tray",
+                "Exit MouseShare?",
+                MB_YESNOCANCEL | MB_ICONQUESTION);
+
+            if (result == IDYES) {
+                // User wants to exit
+                DestroyWindow(hwnd);
+            } else if (result == IDNO) {
+                // User wants to minimize to tray
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            // IDCANCEL - do nothing
             return 0;
         }
         
