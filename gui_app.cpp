@@ -612,14 +612,34 @@ void server_thread_func() {
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
                 // Mark the client computer as connected in our layout
+                bool found_client = false;
                 {
                     std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
                     for (auto& comp : g_app.layout.computers) {
                         if (comp.ip == client_ip) {
                             comp.is_connected = true;
+                            found_client = true;
                             break;
                         }
                     }
+                }
+
+                // Log diagnostic info
+                if (!found_client) {
+                    static char diag_msg[512];
+                    std::string comp_list;
+                    {
+                        std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+                        for (const auto& comp : g_app.layout.computers) {
+                            if (comp.name != g_app.computer_name) {
+                                comp_list += comp.name + "=" + comp.ip + " ";
+                            }
+                        }
+                    }
+                    snprintf(diag_msg, sizeof(diag_msg),
+                        "WARNING: Client %s not found in layout! Known computers: %s",
+                        client_ip, comp_list.c_str());
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)diag_msg);
                 }
 
                 {
