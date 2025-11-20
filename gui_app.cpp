@@ -130,6 +130,7 @@ public:
     Socket server_socket;
     Socket client_socket;
     Socket active_client;
+    std::mutex active_client_mutex;  // Protect active_client from race conditions
     std::atomic<bool> active_on_remote{false};
     
     // This computer's info
@@ -329,24 +330,108 @@ void server_thread_func() {
     g_app.input_capture.set_callbacks(
         // Mouse move
         [](int x, int y, int dx, int dy) {
+            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
             if (!g_app.active_client.is_valid()) return;
-            
-            // Check for edge switching
-            bool at_right_edge = (x >= g_app.local_info.screen_width - 1);
-            
-            if (at_right_edge && !g_app.active_on_remote) {
+
+            // Check for edge switching using monitor layout
+            bool at_edge = false;
+            ScreenEdge edge = ScreenEdge::NONE;
+            int edge_position = 0;
+
+            // Find if we're at an edge that connects to another computer
+            {
+                std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+
+                // Check all edges
+                if (x <= 0) {
+                    at_edge = true;
+                    edge = ScreenEdge::LEFT;
+                    edge_position = y;
+                } else if (x >= g_app.local_info.screen_width - 1) {
+                    at_edge = true;
+                    edge = ScreenEdge::RIGHT;
+                    edge_position = y;
+                } else if (y <= 0) {
+                    at_edge = true;
+                    edge = ScreenEdge::TOP;
+                    edge_position = x;
+                } else if (y >= g_app.local_info.screen_height - 1) {
+                    at_edge = true;
+                    edge = ScreenEdge::BOTTOM;
+                    edge_position = x;
+                }
+
+                // Verify there's a computer at this edge in the layout
+                if (at_edge) {
+                    bool found_neighbor = false;
+                    for (const auto& comp : g_app.layout.computers) {
+                        if (comp.name == g_app.computer_name) continue;
+                        if (!comp.is_connected) continue;
+
+                        // Check if computer is positioned at this edge
+                        int local_x = g_app.local_info.layout_x;
+                        int local_y = g_app.local_info.layout_y;
+                        int local_w = g_app.local_info.screen_width;
+                        int local_h = g_app.local_info.screen_height;
+
+                        if (edge == ScreenEdge::RIGHT &&
+                            comp.layout_x == local_x + local_w &&
+                            comp.layout_y <= local_y + edge_position &&
+                            comp.layout_y + comp.screen_height > local_y + edge_position) {
+                            found_neighbor = true;
+                            break;
+                        } else if (edge == ScreenEdge::LEFT &&
+                            comp.layout_x + comp.screen_width == local_x &&
+                            comp.layout_y <= local_y + edge_position &&
+                            comp.layout_y + comp.screen_height > local_y + edge_position) {
+                            found_neighbor = true;
+                            break;
+                        } else if (edge == ScreenEdge::BOTTOM &&
+                            comp.layout_y == local_y + local_h &&
+                            comp.layout_x <= local_x + edge_position &&
+                            comp.layout_x + comp.screen_width > local_x + edge_position) {
+                            found_neighbor = true;
+                            break;
+                        } else if (edge == ScreenEdge::TOP &&
+                            comp.layout_y + comp.screen_height == local_y &&
+                            comp.layout_x <= local_x + edge_position &&
+                            comp.layout_x + comp.screen_width > local_x + edge_position) {
+                            found_neighbor = true;
+                            break;
+                        }
+                    }
+
+                    if (!found_neighbor) {
+                        at_edge = false;
+                    }
+                }
+            }
+
+            if (at_edge && !g_app.active_on_remote) {
                 // Switch to client
                 g_app.active_on_remote = true;
                 g_app.input_capture.capture_input(true);
-                
+
                 SwitchScreenEvent event;
-                event.edge = ScreenEdge::LEFT;
-                event.position = y;
+                // Send the opposite edge for client entry
+                if (edge == ScreenEdge::RIGHT) event.edge = ScreenEdge::LEFT;
+                else if (edge == ScreenEdge::LEFT) event.edge = ScreenEdge::RIGHT;
+                else if (edge == ScreenEdge::TOP) event.edge = ScreenEdge::BOTTOM;
+                else if (edge == ScreenEdge::BOTTOM) event.edge = ScreenEdge::TOP;
+                event.position = edge_position;
+
                 auto data = serialize_packet(EventType::SWITCH_SCREEN, event);
-                g_app.active_client.send(data);
-                
+                int sent = g_app.active_client.send(data);
+                if (sent <= 0) {
+                    // Send failed - disconnect
+                    g_app.active_on_remote = false;
+                    g_app.input_capture.capture_input(false);
+                    return;
+                }
+
                 // Move cursor away from edge
-                g_app.input_capture.warp_cursor(g_app.local_info.screen_width / 2, y);
+                g_app.input_capture.warp_cursor(g_app.local_info.screen_width / 2,
+                                               g_app.local_info.screen_height / 2);
             } else if (g_app.active_on_remote) {
                 MouseMoveEvent event;
                 event.x = x;
@@ -354,26 +439,45 @@ void server_thread_func() {
                 event.dx = dx;
                 event.dy = dy;
                 auto data = serialize_packet(EventType::MOUSE_MOVE, event);
-                g_app.active_client.send(data);
+                int sent = g_app.active_client.send(data);
+                if (sent <= 0) {
+                    // Send failed - disconnect
+                    g_app.active_on_remote = false;
+                    g_app.input_capture.capture_input(false);
+                }
             }
         },
         // Mouse button
         [](MouseButton button, bool pressed) {
             if (!g_app.active_on_remote) return;
+            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+            if (!g_app.active_client.is_valid()) return;
+
             MouseButtonEvent event;
             event.button = button;
             event.pressed = pressed;
             auto data = serialize_packet(EventType::MOUSE_BUTTON, event);
-            g_app.active_client.send(data);
+            int sent = g_app.active_client.send(data);
+            if (sent <= 0) {
+                g_app.active_on_remote = false;
+                g_app.input_capture.capture_input(false);
+            }
         },
         // Mouse scroll
         [](int dx, int dy) {
             if (!g_app.active_on_remote) return;
+            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+            if (!g_app.active_client.is_valid()) return;
+
             MouseScrollEvent event;
             event.dx = dx;
             event.dy = dy;
             auto data = serialize_packet(EventType::MOUSE_SCROLL, event);
-            g_app.active_client.send(data);
+            int sent = g_app.active_client.send(data);
+            if (sent <= 0) {
+                g_app.active_on_remote = false;
+                g_app.input_capture.capture_input(false);
+            }
         },
         // Keyboard
         [](uint32_t vk, uint32_t scan, uint32_t flags, bool pressed) {
@@ -385,14 +489,21 @@ void server_thread_func() {
                 }
                 return;
             }
-            
+
             if (!g_app.active_on_remote) return;
+            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+            if (!g_app.active_client.is_valid()) return;
+
             KeyEvent event;
             event.vkCode = vk;
             event.scanCode = scan;
             event.flags = flags;
             auto data = serialize_packet(pressed ? EventType::KEY_PRESS : EventType::KEY_RELEASE, event);
-            g_app.active_client.send(data);
+            int sent = g_app.active_client.send(data);
+            if (sent <= 0) {
+                g_app.active_on_remote = false;
+                g_app.input_capture.capture_input(false);
+            }
         }
     );
     
@@ -413,23 +524,35 @@ void server_thread_func() {
             
             timeval tv = {1, 0};
             if (select(0, &readSet, nullptr, nullptr, &tv) > 0) {
-                g_app.active_client = g_app.server_socket.accept();
-                
-                // Send screen info
-                ScreenInfo info;
-                info.width = g_app.local_info.screen_width;
-                info.height = g_app.local_info.screen_height;
-                auto data = serialize_packet(EventType::SCREEN_INFO, info);
-                g_app.active_client.send(data);
-                
+                Socket new_client = g_app.server_socket.accept();
+
+                {
+                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                    g_app.active_client = std::move(new_client);
+
+                    // Send screen info
+                    ScreenInfo info;
+                    info.width = g_app.local_info.screen_width;
+                    info.height = g_app.local_info.screen_height;
+                    auto data = serialize_packet(EventType::SCREEN_INFO, info);
+                    g_app.active_client.send(data);
+                }
+
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client connected");
-                
+
                 // Keep connection alive
-                while (g_app.server_running && g_app.active_client.is_valid()) {
+                while (g_app.server_running) {
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                        if (!g_app.active_client.is_valid()) break;
+                    }
                     Sleep(100);
                 }
-                
-                g_app.active_client.close();
+
+                {
+                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                    g_app.active_client.close();
+                }
                 g_app.active_on_remote = false;
                 g_app.input_capture.capture_input(false);
             }
@@ -458,42 +581,77 @@ void client_thread_func(std::string host, uint16_t port) {
         
         int cursor_x = 0, cursor_y = 0;
         bool active = false;
-        
+        ScreenEdge entry_edge = ScreenEdge::LEFT;
+
         while (g_app.client_connected) {
             PacketHeader header;
             if (!g_app.client_socket.recv_exact(&header, sizeof(header), 100)) {
                 continue;
             }
-            
-            std::vector<char> payload(header.payload_size);
-            if (!g_app.client_socket.recv_exact(payload.data(), header.payload_size)) {
+
+            // Validate packet size (prevent crashes from malformed packets)
+            if (header.payload_size > 65535) {
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Invalid packet size received");
                 break;
             }
-            
+
+            std::vector<char> payload(header.payload_size);
+            if (header.payload_size > 0 && !g_app.client_socket.recv_exact(payload.data(), header.payload_size)) {
+                break;
+            }
+
             switch (header.type) {
                 case EventType::MOUSE_MOVE: {
                     if (!active) break;
+                    if (payload.size() < sizeof(MouseMoveEvent)) break;
+
                     auto* e = (MouseMoveEvent*)payload.data();
                     cursor_x += e->dx;
                     cursor_y += e->dy;
                     cursor_x = (std::max)(0, (std::min)(cursor_x, g_app.local_info.screen_width - 1));
                     cursor_y = (std::max)(0, (std::min)(cursor_y, g_app.local_info.screen_height - 1));
                     g_app.input_simulator.move_mouse(cursor_x, cursor_y);
-                    
-                    // Check for return to server
-                    if (cursor_x <= 0) {
+
+                    // Check for return to server based on entry edge
+                    bool should_return = false;
+                    switch (entry_edge) {
+                        case ScreenEdge::LEFT:
+                            should_return = (cursor_x <= 0);
+                            break;
+                        case ScreenEdge::RIGHT:
+                            should_return = (cursor_x >= g_app.local_info.screen_width - 1);
+                            break;
+                        case ScreenEdge::TOP:
+                            should_return = (cursor_y <= 0);
+                            break;
+                        case ScreenEdge::BOTTOM:
+                            should_return = (cursor_y >= g_app.local_info.screen_height - 1);
+                            break;
+                        default:
+                            break;
+                    }
+
+                    if (should_return) {
                         active = false;
+                        // Move cursor to center to prevent re-trigger
+                        cursor_x = g_app.local_info.screen_width / 2;
+                        cursor_y = g_app.local_info.screen_height / 2;
+                        g_app.input_simulator.move_mouse(cursor_x, cursor_y);
                     }
                     break;
                 }
                 case EventType::MOUSE_BUTTON: {
                     if (!active) break;
+                    if (payload.size() < sizeof(MouseButtonEvent)) break;
+
                     auto* e = (MouseButtonEvent*)payload.data();
                     g_app.input_simulator.mouse_button(e->button, e->pressed);
                     break;
                 }
                 case EventType::MOUSE_SCROLL: {
                     if (!active) break;
+                    if (payload.size() < sizeof(MouseScrollEvent)) break;
+
                     auto* e = (MouseScrollEvent*)payload.data();
                     g_app.input_simulator.mouse_scroll(e->dx, e->dy);
                     break;
@@ -501,16 +659,47 @@ void client_thread_func(std::string host, uint16_t port) {
                 case EventType::KEY_PRESS:
                 case EventType::KEY_RELEASE: {
                     if (!active) break;
+                    if (payload.size() < sizeof(KeyEvent)) break;
+
                     auto* e = (KeyEvent*)payload.data();
                     g_app.input_simulator.key_event(e->vkCode, e->scanCode, e->flags,
                                                     header.type == EventType::KEY_PRESS);
                     break;
                 }
                 case EventType::SWITCH_SCREEN: {
+                    if (payload.size() < sizeof(SwitchScreenEvent)) break;
+
                     auto* e = (SwitchScreenEvent*)payload.data();
                     active = true;
-                    cursor_x = 0;
-                    cursor_y = e->position;
+                    entry_edge = e->edge;
+
+                    // Position cursor based on entry edge
+                    switch (entry_edge) {
+                        case ScreenEdge::LEFT:
+                            cursor_x = 0;
+                            cursor_y = e->position;
+                            break;
+                        case ScreenEdge::RIGHT:
+                            cursor_x = g_app.local_info.screen_width - 1;
+                            cursor_y = e->position;
+                            break;
+                        case ScreenEdge::TOP:
+                            cursor_x = e->position;
+                            cursor_y = 0;
+                            break;
+                        case ScreenEdge::BOTTOM:
+                            cursor_x = e->position;
+                            cursor_y = g_app.local_info.screen_height - 1;
+                            break;
+                        default:
+                            cursor_x = 0;
+                            cursor_y = e->position;
+                            break;
+                    }
+
+                    // Clamp to screen bounds
+                    cursor_x = (std::max)(0, (std::min)(cursor_x, g_app.local_info.screen_width - 1));
+                    cursor_y = (std::max)(0, (std::min)(cursor_y, g_app.local_info.screen_height - 1));
                     g_app.input_simulator.move_mouse(cursor_x, cursor_y);
                     break;
                 }
@@ -908,14 +1097,27 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         g_app.server_thread->join();
                     }
                     g_app.server_socket.close();
-                    g_app.active_client.close();
-                    
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                        g_app.active_client.close();
+                    }
+
+                    // Mark all computers as disconnected
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.layout_mutex);
+                        for (auto& comp : g_app.layout.computers) {
+                            comp.is_connected = false;
+                        }
+                    }
+
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), TRUE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_STOP_SERVER), FALSE);
                     // Re-enable client controls
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), TRUE);
-                    
+
                     SendMessageA(g_app.hwnd_status, SB_SETTEXTA, 0, (LPARAM)"Server stopped");
+                    InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
                     break;
                 }
                 
@@ -923,11 +1125,11 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     // Get selected computer
                     int sel = ListView_GetNextItem(g_app.hwnd_list, -1, LVNI_SELECTED);
                     if (sel < 0) {
-                        MessageBoxA(hwnd, "Please select a computer to connect to", 
+                        MessageBoxA(hwnd, "Please select a computer to connect to",
                                   "MouseShare", MB_OK | MB_ICONINFORMATION);
                         break;
                     }
-                    
+
                     char name[256], ip[64];
                     // Get computer name
                     LVITEMA item = {};
@@ -941,26 +1143,27 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     item.pszText = ip;
                     item.cchTextMax = sizeof(ip);
                     SendMessageA(g_app.hwnd_list, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
-                    
-                    // Find port
+
+                    // Find port and mark as connected
                     uint16_t port = DEFAULT_PORT;
                     {
                         std::lock_guard<std::mutex> lock(g_app.layout_mutex);
-                        for (const auto& comp : g_app.layout.computers) {
+                        for (auto& comp : g_app.layout.computers) {
                             if (comp.name == name) {
                                 port = comp.port;
+                                comp.is_connected = true;
                                 break;
                             }
                         }
                     }
-                    
+
                     // Show connecting status
                     std::string status_msg = "Connecting to " + std::string(ip) + ":" + std::to_string(port) + "...";
                     SendMessageA(g_app.hwnd_status, SB_SETTEXTA, 0, (LPARAM)status_msg.c_str());
-                    
+
                     g_app.client_thread = std::make_unique<std::thread>(
                         client_thread_func, std::string(ip), port);
-                    
+
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), FALSE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_DISCONNECT), TRUE);
                     // Disable server controls when running as client
@@ -975,11 +1178,20 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         g_app.client_thread->join();
                     }
                     g_app.client_socket.close();
-                    
+
+                    // Mark all computers as disconnected
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.layout_mutex);
+                        for (auto& comp : g_app.layout.computers) {
+                            comp.is_connected = false;
+                        }
+                    }
+
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), TRUE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_DISCONNECT), FALSE);
                     // Re-enable server controls
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), TRUE);
+                    InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
                     break;
                 }
                 
