@@ -133,7 +133,11 @@ public:
     Socket active_client;
     std::mutex active_client_mutex;  // Protect active_client from race conditions
     std::atomic<bool> active_on_remote{false};
-    
+
+    // Virtual cursor for server when controlling remote
+    int virtual_cursor_x = 0;
+    int virtual_cursor_y = 0;
+
     // This computer's info
     ComputerInfo local_info;
     
@@ -338,7 +342,63 @@ void server_thread_func() {
             bool has_client = g_app.active_client.is_valid();
             if (!has_client) return;
 
-            // Check for edge switching using monitor layout
+            if (g_app.active_on_remote) {
+                // Update virtual cursor position with the deltas we received
+                g_app.virtual_cursor_x += dx;
+                g_app.virtual_cursor_y += dy;
+
+                // Clamp virtual cursor to screen bounds for edge detection
+                g_app.virtual_cursor_x = (std::max)(0, (std::min)(g_app.virtual_cursor_x, g_app.local_info.screen_width - 1));
+                g_app.virtual_cursor_y = (std::max)(0, (std::min)(g_app.virtual_cursor_y, g_app.local_info.screen_height - 1));
+
+                // Send movement to client
+                MouseMoveEvent event;
+                event.x = g_app.virtual_cursor_x;
+                event.y = g_app.virtual_cursor_y;
+                event.dx = dx;  // Real delta from Windows!
+                event.dy = dy;
+                auto data = serialize_packet(EventType::MOUSE_MOVE, event);
+
+                // Lock only for the send operation
+                {
+                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                    if (g_app.active_client.is_valid()) {
+                        int sent = g_app.active_client.send(data);
+                        if (sent <= 0) {
+                            // Send failed - disconnect
+                            g_app.active_on_remote = false;
+                            g_app.input_capture.capture_input(false);
+                        }
+                    }
+                }
+
+                // Check for edge with virtual cursor
+                bool at_edge = false;
+                ScreenEdge edge = ScreenEdge::NONE;
+
+                if (g_app.virtual_cursor_x <= 0) {
+                    at_edge = true;
+                    edge = ScreenEdge::LEFT;
+                } else if (g_app.virtual_cursor_x >= g_app.local_info.screen_width - 1) {
+                    at_edge = true;
+                    edge = ScreenEdge::RIGHT;
+                } else if (g_app.virtual_cursor_y <= 0) {
+                    at_edge = true;
+                    edge = ScreenEdge::TOP;
+                } else if (g_app.virtual_cursor_y >= g_app.local_info.screen_height - 1) {
+                    at_edge = true;
+                    edge = ScreenEdge::BOTTOM;
+                }
+
+                if (at_edge) {
+                    // Could implement edge switching back to local here
+                    // For now, just clamp to edge
+                }
+
+                return;  // Don't process edge detection when already on remote
+            }
+
+            // Not on remote - check for edge switching to remote
             bool at_edge = false;
             ScreenEdge edge = ScreenEdge::NONE;
             int edge_position = 0;
@@ -412,10 +472,16 @@ void server_thread_func() {
                 }
             }
 
-            if (at_edge && !g_app.active_on_remote) {
-                // Switch to client
+            if (at_edge) {
+                // Switch to remote control
                 g_app.active_on_remote = true;
-                // DON'T call capture_input - let cursor move naturally to generate dx/dy
+
+                // Initialize virtual cursor to current position
+                g_app.virtual_cursor_x = x;
+                g_app.virtual_cursor_y = y;
+
+                // Now capture input to block local cursor
+                g_app.input_capture.capture_input(true);
 
                 SwitchScreenEvent event;
                 // Send the opposite edge for client entry
@@ -435,31 +501,13 @@ void server_thread_func() {
                         if (sent <= 0) {
                             // Send failed - disconnect
                             g_app.active_on_remote = false;
+                            g_app.input_capture.capture_input(false);
                             return;
                         }
                     }
                 }
 
-                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Edge detected - now controlling remote");
-            } else if (g_app.active_on_remote) {
-                MouseMoveEvent event;
-                event.x = x;
-                event.y = y;
-                event.dx = dx;
-                event.dy = dy;
-                auto data = serialize_packet(EventType::MOUSE_MOVE, event);
-
-                // Lock only for the send operation
-                {
-                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
-                    if (g_app.active_client.is_valid()) {
-                        int sent = g_app.active_client.send(data);
-                        if (sent <= 0) {
-                            // Send failed - disconnect
-                            g_app.active_on_remote = false;
-                        }
-                    }
-                }
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Edge detected - now controlling remote (cursor captured)");
             }
         },
         // Mouse button
@@ -503,8 +551,21 @@ void server_thread_func() {
                     g_app.active_on_remote = !g_app.active_on_remote;
                     bool new_state = g_app.active_on_remote;
 
-                    // DON'T call capture_input - we need real dx/dy values
-                    // The hook will still send movements to remote when active_on_remote is true
+                    if (new_state) {
+                        // Get current cursor position to initialize virtual cursor
+                        POINT pt;
+                        GetCursorPos(&pt);
+                        HWND desktop = GetDesktopWindow();
+                        ScreenToClient(desktop, &pt);
+                        g_app.virtual_cursor_x = pt.x;
+                        g_app.virtual_cursor_y = pt.y;
+
+                        // Now capture input to block local cursor
+                        g_app.input_capture.capture_input(true);
+                    } else {
+                        // Release capture
+                        g_app.input_capture.capture_input(false);
+                    }
 
                     // Check if we have a connected neighbor for diagnostics
                     int connected_count = 0;
@@ -519,9 +580,9 @@ void server_thread_func() {
 
                     static char msg[256];
                     if (new_state) {
-                        snprintf(msg, sizeof(msg), "F8: REMOTE control - Server cursor will move, client mirrors (%d connected)", connected_count);
+                        snprintf(msg, sizeof(msg), "F8: REMOTE control - Virtual cursor active, real dx/dy sent (%d connected)", connected_count);
                     } else {
-                        snprintf(msg, sizeof(msg), "F8: LOCAL control - Back to normal");
+                        snprintf(msg, sizeof(msg), "F8: LOCAL control - Cursor released");
                     }
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
 
@@ -537,8 +598,10 @@ void server_thread_func() {
                             int sent = g_app.active_client.send(data);
                             if (sent <= 0) {
                                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Failed to send SWITCH_SCREEN to client!");
+                                g_app.input_capture.capture_input(false);
+                                g_app.active_on_remote = false;
                             } else {
-                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: SWITCH_SCREEN sent! Move server mouse to test.");
+                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Input captured! Move mouse to send to client.");
                             }
                         }
                     }
@@ -550,6 +613,7 @@ void server_thread_func() {
             if (vk == VK_SCROLL && pressed) {
                 if (g_app.active_on_remote) {
                     g_app.active_on_remote = false;
+                    g_app.input_capture.capture_input(false);
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"ScrollLock: Switched to LOCAL control");
                 }
                 return;
