@@ -176,6 +176,7 @@ struct DiscoveryPacket {
     uint16_t port;
     int32_t screen_width;
     int32_t screen_height;
+    uint8_t is_server;  // 1 if running as server, 0 otherwise
     char name[64];
 };
 #pragma pack(pop)
@@ -187,6 +188,7 @@ void broadcast_presence() {
     packet.port = g_app.port;
     packet.screen_width = g_app.local_info.screen_width;
     packet.screen_height = g_app.local_info.screen_height;
+    packet.is_server = g_app.server_running ? 1 : 0;
     strncpy_s(packet.name, g_app.computer_name.c_str(), sizeof(packet.name) - 1);
     
     sockaddr_in broadcast_addr = {};
@@ -263,12 +265,13 @@ void discovery_thread_func() {
                             comp.port = packet->port;
                             comp.screen_width = packet->screen_width;
                             comp.screen_height = packet->screen_height;
+                            comp.is_server = (packet->is_server == 1);
                             comp.last_seen = GetTickCount();
                             found = true;
                             break;
                         }
                     }
-                    
+
                     if (!found) {
                         ComputerInfo info;
                         info.name = packet->name;
@@ -276,7 +279,7 @@ void discovery_thread_func() {
                         info.port = packet->port;
                         info.screen_width = packet->screen_width;
                         info.screen_height = packet->screen_height;
-                        info.is_server = false;
+                        info.is_server = (packet->is_server == 1);
                         info.is_connected = false;
                         info.last_seen = GetTickCount();
                         
@@ -330,8 +333,9 @@ void server_thread_func() {
     g_app.input_capture.set_callbacks(
         // Mouse move
         [](int x, int y, int dx, int dy) {
-            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
-            if (!g_app.active_client.is_valid()) return;
+            // Check if we have a client connection (quick check without full lock)
+            bool has_client = g_app.active_client.is_valid();
+            if (!has_client) return;
 
             // Check for edge switching using monitor layout
             bool at_edge = false;
@@ -421,12 +425,19 @@ void server_thread_func() {
                 event.position = edge_position;
 
                 auto data = serialize_packet(EventType::SWITCH_SCREEN, event);
-                int sent = g_app.active_client.send(data);
-                if (sent <= 0) {
-                    // Send failed - disconnect
-                    g_app.active_on_remote = false;
-                    g_app.input_capture.capture_input(false);
-                    return;
+
+                // Lock only for the send operation
+                {
+                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                    if (g_app.active_client.is_valid()) {
+                        int sent = g_app.active_client.send(data);
+                        if (sent <= 0) {
+                            // Send failed - disconnect
+                            g_app.active_on_remote = false;
+                            g_app.input_capture.capture_input(false);
+                            return;
+                        }
+                    }
                 }
 
                 // Move cursor away from edge
@@ -439,11 +450,18 @@ void server_thread_func() {
                 event.dx = dx;
                 event.dy = dy;
                 auto data = serialize_packet(EventType::MOUSE_MOVE, event);
-                int sent = g_app.active_client.send(data);
-                if (sent <= 0) {
-                    // Send failed - disconnect
-                    g_app.active_on_remote = false;
-                    g_app.input_capture.capture_input(false);
+
+                // Lock only for the send operation
+                {
+                    std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                    if (g_app.active_client.is_valid()) {
+                        int sent = g_app.active_client.send(data);
+                        if (sent <= 0) {
+                            // Send failed - disconnect
+                            g_app.active_on_remote = false;
+                            g_app.input_capture.capture_input(false);
+                        }
+                    }
                 }
             }
         },
@@ -483,23 +501,32 @@ void server_thread_func() {
         [](uint32_t vk, uint32_t scan, uint32_t flags, bool pressed) {
             // F8 to manually toggle input control (for testing)
             if (vk == VK_F8 && pressed) {
-                std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
-                if (g_app.active_client.is_valid()) {
+                // Check if client exists first (without holding lock)
+                bool has_client = g_app.active_client.is_valid();
+                if (has_client) {
+                    // Toggle state
                     g_app.active_on_remote = !g_app.active_on_remote;
-                    g_app.input_capture.capture_input(g_app.active_on_remote);
+                    bool new_state = g_app.active_on_remote;
 
-                    const char* msg = g_app.active_on_remote ?
+                    // Call capture_input WITHOUT holding any lock
+                    g_app.input_capture.capture_input(new_state);
+
+                    const char* msg = new_state ?
                         "F8: Switched to REMOTE control" :
                         "F8: Switched to LOCAL control";
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
 
-                    if (g_app.active_on_remote) {
-                        // Send switch event to remote
+                    if (new_state) {
+                        // Send switch event to remote - lock only for sending
                         SwitchScreenEvent event;
                         event.edge = ScreenEdge::LEFT;
                         event.position = GetSystemMetrics(SM_CYSCREEN) / 2;
                         auto data = serialize_packet(EventType::SWITCH_SCREEN, event);
-                        g_app.active_client.send(data);
+
+                        std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                        if (g_app.active_client.is_valid()) {
+                            g_app.active_client.send(data);
+                        }
                     }
                 }
                 return;
@@ -516,19 +543,24 @@ void server_thread_func() {
             }
 
             if (!g_app.active_on_remote) return;
-            std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
-            if (!g_app.active_client.is_valid()) return;
 
             KeyEvent event;
             event.vkCode = vk;
             event.scanCode = scan;
             event.flags = flags;
             auto data = serialize_packet(pressed ? EventType::KEY_PRESS : EventType::KEY_RELEASE, event);
-            int sent = g_app.active_client.send(data);
-            if (sent <= 0) {
-                g_app.active_on_remote = false;
-                g_app.input_capture.capture_input(false);
-                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Connection lost - switched to LOCAL control");
+
+            // Lock only for sending
+            {
+                std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
+                if (g_app.active_client.is_valid()) {
+                    int sent = g_app.active_client.send(data);
+                    if (sent <= 0) {
+                        g_app.active_on_remote = false;
+                        g_app.input_capture.capture_input(false);
+                        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Connection lost - switched to LOCAL control");
+                    }
+                }
             }
         }
     );
@@ -1089,6 +1121,19 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         
         case WM_TIMER: {
             if (wParam == TIMER_UPDATE) {
+                // Save selected item name before refresh
+                int sel = ListView_GetNextItem(g_app.hwnd_list, -1, LVNI_SELECTED);
+                std::string selected_name;
+                if (sel >= 0) {
+                    char name[256];
+                    LVITEMA item = {};
+                    item.iSubItem = 0;
+                    item.pszText = name;
+                    item.cchTextMax = sizeof(name);
+                    SendMessageA(g_app.hwnd_list, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+                    selected_name = name;
+                }
+
                 // Update computer list
                 std::lock_guard<std::mutex> lock(g_app.layout_mutex);
 
@@ -1136,6 +1181,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     } else {
                         if (comp.is_connected) {
                             status = "Connected";
+                        } else if (comp.is_server) {
+                            status = "Server (Available)";
                         } else {
                             status = "Available";
                         }
@@ -1144,6 +1191,11 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     subitem.iSubItem = 2;
                     subitem.pszText = (LPSTR)status.c_str();
                     SendMessageA(g_app.hwnd_list, LVM_SETITEMA, 0, (LPARAM)&subitem);
+
+                    // Restore selection if this was the selected item
+                    if (!selected_name.empty() && comp.name == selected_name) {
+                        ListView_SetItemState(g_app.hwnd_list, idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    }
                 }
 
                 InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
