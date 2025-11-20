@@ -896,6 +896,9 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), FALSE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_STOP_SERVER), TRUE);
+                    // Disable client controls when running as server
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), FALSE);
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_DISCONNECT), FALSE);
                     break;
                 }
                 
@@ -909,6 +912,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), TRUE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_STOP_SERVER), FALSE);
+                    // Re-enable client controls
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), TRUE);
                     
                     SendMessageA(g_app.hwnd_status, SB_SETTEXTA, 0, (LPARAM)"Server stopped");
                     break;
@@ -916,26 +921,26 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 
                 case ID_BTN_CONNECT: {
                     // Get selected computer
-                    int sel = (int)SendMessageA(g_app.hwnd_list, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                    int sel = ListView_GetNextItem(g_app.hwnd_list, -1, LVNI_SELECTED);
                     if (sel < 0) {
                         MessageBoxA(hwnd, "Please select a computer to connect to", 
-                                   "MouseShare", MB_OK | MB_ICONINFORMATION);
+                                  "MouseShare", MB_OK | MB_ICONINFORMATION);
                         break;
                     }
                     
                     char name[256], ip[64];
+                    // Get computer name
                     LVITEMA item = {};
-                    item.mask = LVIF_TEXT;
-                    item.iItem = sel;
                     item.iSubItem = 0;
                     item.pszText = name;
                     item.cchTextMax = sizeof(name);
-                    SendMessageA(g_app.hwnd_list, LVM_GETITEMA, 0, (LPARAM)&item);
-                    
+                    SendMessageA(g_app.hwnd_list, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+
+                    // Get IP address
                     item.iSubItem = 1;
                     item.pszText = ip;
                     item.cchTextMax = sizeof(ip);
-                    SendMessageA(g_app.hwnd_list, LVM_GETITEMA, 0, (LPARAM)&item);
+                    SendMessageA(g_app.hwnd_list, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
                     
                     // Find port
                     uint16_t port = DEFAULT_PORT;
@@ -949,11 +954,18 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         }
                     }
                     
+                    // Show connecting status
+                    std::string status_msg = "Connecting to " + std::string(ip) + ":" + std::to_string(port) + "...";
+                    SendMessageA(g_app.hwnd_status, SB_SETTEXTA, 0, (LPARAM)status_msg.c_str());
+                    
                     g_app.client_thread = std::make_unique<std::thread>(
                         client_thread_func, std::string(ip), port);
                     
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), FALSE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_DISCONNECT), TRUE);
+                    // Disable server controls when running as client
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), FALSE);
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_STOP_SERVER), FALSE);
                     break;
                 }
                 
@@ -966,6 +978,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_CONNECT), TRUE);
                     EnableWindow(GetDlgItem(hwnd, ID_BTN_DISCONNECT), FALSE);
+                    // Re-enable server controls
+                    EnableWindow(GetDlgItem(hwnd, ID_BTN_START_SERVER), TRUE);
                     break;
                 }
                 
