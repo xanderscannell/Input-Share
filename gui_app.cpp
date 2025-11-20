@@ -638,31 +638,12 @@ void server_thread_func() {
                 snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
 
-                // Keep connection alive and detect disconnect
+                // Keep connection alive
                 while (g_app.server_running) {
-                    bool still_connected = false;
                     {
                         std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
                         if (!g_app.active_client.is_valid()) break;
-
-                        // Check if client is still connected by trying to peek
-                        char peek_buf[1];
-                        int peek_result = recv(g_app.active_client.handle(), peek_buf, 1, MSG_PEEK);
-
-                        if (peek_result == 0) {
-                            // Connection closed gracefully
-                            break;
-                        } else if (peek_result < 0) {
-                            int err = WSAGetLastError();
-                            if (err != WSAEWOULDBLOCK) {
-                                // Connection error
-                                break;
-                            }
-                        }
-                        still_connected = true;
                     }
-
-                    if (!still_connected) break;
                     Sleep(100);
                 }
 
