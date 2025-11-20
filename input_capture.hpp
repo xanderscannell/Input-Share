@@ -56,6 +56,7 @@ public:
     
     void stop() {
         running_ = false;
+        captured_ = false;  // Always release on stop
         if (hook_thread_.joinable()) {
             // Post quit message to hook thread
             PostThreadMessage(hook_thread_id_, WM_QUIT, 0, 0);
@@ -65,6 +66,9 @@ public:
     
     void capture_input(bool capture) {
         captured_ = capture;
+        if (capture) {
+            last_activity_ = GetTickCount();
+        }
     }
     
     bool is_captured() const {
@@ -111,6 +115,15 @@ private:
         while (running_ && GetMessage(&msg, nullptr, 0, 0)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
+            
+            // Safety timeout: release capture after 30 seconds of no activity
+            if (instance_ && instance_->captured_) {
+                DWORD now = GetTickCount();
+                if ((now - instance_->last_activity_) > 30000) {
+                    std::cerr << "Safety timeout: releasing input capture\n";
+                    instance_->captured_ = false;
+                }
+            }
         }
         
         // Cleanup hooks
@@ -118,9 +131,46 @@ private:
         UnhookWindowsHookEx(keyboard_hook_);
     }
     
+    static bool is_emergency_key(DWORD vkCode, bool ctrl_down, bool alt_down) {
+        // ALWAYS allow these through - never block them
+        
+        // Ctrl+Alt+Delete components
+        if (vkCode == VK_DELETE && ctrl_down && alt_down) return true;
+        
+        // Allow Ctrl, Alt, Delete keys themselves to pass through
+        if (vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) return true;
+        if (vkCode == VK_MENU || vkCode == VK_LMENU || vkCode == VK_RMENU) return true;  // Alt key
+        if (vkCode == VK_DELETE) return true;
+        
+        // Scroll Lock - our toggle key
+        if (vkCode == VK_SCROLL) return true;
+        
+        // Escape key - emergency release
+        if (vkCode == VK_ESCAPE && ctrl_down && alt_down) return true;
+        
+        // Windows key - always allow
+        if (vkCode == VK_LWIN || vkCode == VK_RWIN) return true;
+        
+        // Ctrl+Shift+Escape (Task Manager)
+        if (vkCode == VK_ESCAPE && ctrl_down) return true;
+        
+        // Alt+Tab
+        if (vkCode == VK_TAB && alt_down) return true;
+        
+        // Alt+F4
+        if (vkCode == VK_F4 && alt_down) return true;
+        
+        return false;
+    }
+    
     static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (nCode >= 0 && instance_) {
             auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+            
+            // Update activity timestamp
+            if (instance_->captured_) {
+                instance_->last_activity_ = GetTickCount();
+            }
             
             switch (wParam) {
                 case WM_MOUSEMOVE: {
@@ -193,7 +243,7 @@ private:
                     break;
             }
             
-            // Block input if captured
+            // Block mouse input if captured
             if (instance_->captured_) {
                 return 1;
             }
@@ -207,16 +257,42 @@ private:
             auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
             bool pressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
             
-            // Check for Scroll Lock to toggle
-            if (kb->vkCode == VK_SCROLL && pressed) {
-                // This will be handled by the callback
+            // Check modifier states
+            bool ctrl_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            bool shift_down = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            
+            // NEVER block emergency keys
+            if (is_emergency_key(kb->vkCode, ctrl_down, alt_down)) {
+                // Handle Scroll Lock toggle ourselves, but still pass it through
+                if (kb->vkCode == VK_SCROLL && pressed) {
+                    if (instance_->captured_) {
+                        std::cerr << "Scroll Lock pressed: releasing input capture\n";
+                        instance_->captured_ = false;
+                    }
+                }
+                
+                // Handle Ctrl+Alt+Escape as emergency release
+                if (kb->vkCode == VK_ESCAPE && ctrl_down && alt_down && pressed) {
+                    std::cerr << "Emergency release: Ctrl+Alt+Escape\n";
+                    instance_->captured_ = false;
+                }
+                
+                // Always pass emergency keys through - NEVER block
+                return CallNextHookEx(nullptr, nCode, wParam, lParam);
             }
             
+            // Update activity timestamp
+            if (instance_->captured_) {
+                instance_->last_activity_ = GetTickCount();
+            }
+            
+            // Regular key handling
             if (instance_->key_callback_) {
                 instance_->key_callback_(kb->vkCode, kb->scanCode, kb->flags, pressed);
             }
             
-            // Block input if captured
+            // Block input if captured (but only non-emergency keys)
             if (instance_->captured_) {
                 return 1;
             }
@@ -236,6 +312,7 @@ private:
     std::atomic<bool> captured_;
     std::thread hook_thread_;
     DWORD hook_thread_id_ = 0;
+    DWORD last_activity_ = 0;
     
     HHOOK mouse_hook_ = nullptr;
     HHOOK keyboard_hook_ = nullptr;
