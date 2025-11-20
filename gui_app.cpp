@@ -716,11 +716,13 @@ void server_thread_func() {
                 snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
 
-                // Keep connection alive
+                // Keep connection alive and monitor for disconnect
                 while (g_app.server_running) {
                     {
                         std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
-                        if (!g_app.active_client.is_valid()) break;
+                        if (!g_app.active_client.is_valid() || !g_app.active_client.is_connected()) {
+                            break;
+                        }
                     }
                     Sleep(100);
                 }

@@ -160,7 +160,32 @@ public:
     
     bool is_valid() const { return sock_ != INVALID_SOCKET; }
     SOCKET handle() const { return sock_; }
-    
+
+    // Check if connection is still alive (non-blocking)
+    bool is_connected() const {
+        if (sock_ == INVALID_SOCKET) return false;
+
+        // Use select to check if socket is readable
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(sock_, &readSet);
+
+        timeval tv = {0, 0};  // No timeout - immediate return
+        int result = select(0, &readSet, nullptr, nullptr, &tv);
+
+        if (result > 0) {
+            // Socket is readable - check if it's because of disconnect
+            char buffer[1];
+            int n = ::recv(sock_, buffer, 1, MSG_PEEK);
+            if (n <= 0) {
+                // Connection closed or error
+                return false;
+            }
+        }
+
+        return true;
+    }
+
 private:
     SOCKET sock_;
 };

@@ -176,13 +176,17 @@ private:
                 case WM_MOUSEMOVE: {
                     int dx = ms->pt.x - instance_->last_x_;
                     int dy = ms->pt.y - instance_->last_y_;
-                    
+
                     if (instance_->move_callback_ && (dx != 0 || dy != 0)) {
                         instance_->move_callback_(ms->pt.x, ms->pt.y, dx, dy);
                     }
-                    
-                    instance_->last_x_ = ms->pt.x;
-                    instance_->last_y_ = ms->pt.y;
+
+                    // Only update last position if we're NOT blocking the event
+                    // If captured, cursor won't actually move, so keep last position as-is
+                    if (!instance_->captured_) {
+                        instance_->last_x_ = ms->pt.x;
+                        instance_->last_y_ = ms->pt.y;
+                    }
                     break;
                 }
                 
