@@ -133,6 +133,7 @@ public:
     Socket active_client;
     std::mutex active_client_mutex;  // Protect active_client from race conditions
     std::atomic<bool> active_on_remote{false};
+    std::atomic<bool> manual_mode{false};  // Track if we're in manual toggle mode (vs automatic edge mode)
 
     // Virtual cursor for server when controlling remote
     int virtual_cursor_x = 0;
@@ -372,27 +373,31 @@ void server_thread_func() {
                     }
                 }
 
-                // Check for edge with virtual cursor
-                bool at_edge = false;
-                ScreenEdge edge = ScreenEdge::NONE;
+                // In manual mode, don't process edge detection - just stay active
+                // In automatic mode, check edges to potentially switch back
+                if (!g_app.manual_mode) {
+                    // Check for edge with virtual cursor (for automatic mode only)
+                    bool at_edge = false;
+                    ScreenEdge edge = ScreenEdge::NONE;
 
-                if (g_app.virtual_cursor_x <= 0) {
-                    at_edge = true;
-                    edge = ScreenEdge::LEFT;
-                } else if (g_app.virtual_cursor_x >= g_app.local_info.screen_width - 1) {
-                    at_edge = true;
-                    edge = ScreenEdge::RIGHT;
-                } else if (g_app.virtual_cursor_y <= 0) {
-                    at_edge = true;
-                    edge = ScreenEdge::TOP;
-                } else if (g_app.virtual_cursor_y >= g_app.local_info.screen_height - 1) {
-                    at_edge = true;
-                    edge = ScreenEdge::BOTTOM;
-                }
+                    if (g_app.virtual_cursor_x <= 0) {
+                        at_edge = true;
+                        edge = ScreenEdge::LEFT;
+                    } else if (g_app.virtual_cursor_x >= g_app.local_info.screen_width - 1) {
+                        at_edge = true;
+                        edge = ScreenEdge::RIGHT;
+                    } else if (g_app.virtual_cursor_y <= 0) {
+                        at_edge = true;
+                        edge = ScreenEdge::TOP;
+                    } else if (g_app.virtual_cursor_y >= g_app.local_info.screen_height - 1) {
+                        at_edge = true;
+                        edge = ScreenEdge::BOTTOM;
+                    }
 
-                if (at_edge) {
-                    // Could implement edge switching back to local here
-                    // For now, just clamp to edge
+                    if (at_edge) {
+                        // Could implement edge switching back to local here
+                        // For now, just clamp to edge
+                    }
                 }
 
                 return;  // Don't process edge detection when already on remote
@@ -473,8 +478,9 @@ void server_thread_func() {
             }
 
             if (at_edge) {
-                // Switch to remote control
+                // Switch to remote control (automatic edge mode)
                 g_app.active_on_remote = true;
+                g_app.manual_mode = false;  // This is automatic mode, not manual
 
                 // Initialize virtual cursor to current position
                 g_app.virtual_cursor_x = x;
@@ -549,14 +555,14 @@ void server_thread_func() {
                 if (has_client) {
                     // Toggle state
                     g_app.active_on_remote = !g_app.active_on_remote;
+                    g_app.manual_mode = g_app.active_on_remote;  // Set manual mode flag
                     bool new_state = g_app.active_on_remote;
 
                     if (new_state) {
                         // Get current cursor position to initialize virtual cursor
                         POINT pt;
                         GetCursorPos(&pt);
-                        HWND desktop = GetDesktopWindow();
-                        ScreenToClient(desktop, &pt);
+                        // GetCursorPos returns screen coordinates, which is what we need
                         g_app.virtual_cursor_x = pt.x;
                         g_app.virtual_cursor_y = pt.y;
 
@@ -613,6 +619,7 @@ void server_thread_func() {
             if (vk == VK_SCROLL && pressed) {
                 if (g_app.active_on_remote) {
                     g_app.active_on_remote = false;
+                    g_app.manual_mode = false;  // Clear manual mode
                     g_app.input_capture.capture_input(false);
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"ScrollLock: Switched to LOCAL control");
                 }
@@ -771,6 +778,7 @@ void client_thread_func(std::string host, uint16_t port) {
         
         int cursor_x = 0, cursor_y = 0;
         bool active = false;
+        bool client_manual_mode = false;  // Track if client is in manual mode
         ScreenEdge entry_edge = ScreenEdge::LEFT;
 
         while (g_app.client_connected) {
@@ -802,33 +810,36 @@ void client_thread_func(std::string host, uint16_t port) {
                     cursor_y = (std::max)(0, (std::min)(cursor_y, g_app.local_info.screen_height - 1));
                     g_app.input_simulator.move_mouse(cursor_x, cursor_y);
 
-                    // Check for return to server based on entry edge
-                    bool should_return = false;
-                    switch (entry_edge) {
-                        case ScreenEdge::LEFT:
-                            should_return = (cursor_x <= 0);
-                            break;
-                        case ScreenEdge::RIGHT:
-                            should_return = (cursor_x >= g_app.local_info.screen_width - 1);
-                            break;
-                        case ScreenEdge::TOP:
-                            should_return = (cursor_y <= 0);
-                            break;
-                        case ScreenEdge::BOTTOM:
-                            should_return = (cursor_y >= g_app.local_info.screen_height - 1);
-                            break;
-                        default:
-                            break;
-                    }
+                    // Only check for return to server in automatic mode, not manual mode
+                    if (!client_manual_mode) {
+                        // Check for return to server based on entry edge
+                        bool should_return = false;
+                        switch (entry_edge) {
+                            case ScreenEdge::LEFT:
+                                should_return = (cursor_x <= 0);
+                                break;
+                            case ScreenEdge::RIGHT:
+                                should_return = (cursor_x >= g_app.local_info.screen_width - 1);
+                                break;
+                            case ScreenEdge::TOP:
+                                should_return = (cursor_y <= 0);
+                                break;
+                            case ScreenEdge::BOTTOM:
+                                should_return = (cursor_y >= g_app.local_info.screen_height - 1);
+                                break;
+                            default:
+                                break;
+                        }
 
-                    if (should_return) {
-                        active = false;
-                        g_app.client_is_receiving = false;  // Update global state
-                        // Move cursor to center to prevent re-trigger
-                        cursor_x = g_app.local_info.screen_width / 2;
-                        cursor_y = g_app.local_info.screen_height / 2;
-                        g_app.input_simulator.move_mouse(cursor_x, cursor_y);
-                        PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client returned control to server");
+                        if (should_return) {
+                            active = false;
+                            g_app.client_is_receiving = false;  // Update global state
+                            // Move cursor to center to prevent re-trigger
+                            cursor_x = g_app.local_info.screen_width / 2;
+                            cursor_y = g_app.local_info.screen_height / 2;
+                            g_app.input_simulator.move_mouse(cursor_x, cursor_y);
+                            PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client returned control to server");
+                        }
                     }
                     break;
                 }
@@ -865,6 +876,10 @@ void client_thread_func(std::string host, uint16_t port) {
                     active = true;
                     g_app.client_is_receiving = true;  // Update global state for GUI
                     entry_edge = e->edge;
+
+                    // Detect manual mode: server sends LEFT edge with center Y position
+                    int center_y = GetSystemMetrics(SM_CYSCREEN) / 2;
+                    client_manual_mode = (e->edge == ScreenEdge::LEFT && e->position == center_y);
 
                     // Position cursor based on entry edge
                     switch (entry_edge) {
