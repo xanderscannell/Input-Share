@@ -329,6 +329,36 @@ void discovery_thread_func() {
 // Server/Client Logic
 // ============================================================================
 
+// Broadcast current layout to connected client
+void broadcast_layout_to_client() {
+    std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+    std::lock_guard<std::mutex> client_lock(g_app.active_client_mutex);
+
+    // Only broadcast if we have a connected client
+    if (!g_app.active_client.is_valid()) {
+        return;
+    }
+
+    // Send layout info for each computer
+    for (const auto& comp : g_app.layout.computers) {
+        ComputerLayoutInfo info = {};
+
+        // Copy computer name (truncate if needed)
+        strncpy_s(info.name, comp.name.c_str(), sizeof(info.name) - 1);
+        info.name[sizeof(info.name) - 1] = '\0';
+
+        info.screen_width = comp.screen_width;
+        info.screen_height = comp.screen_height;
+        info.layout_x = comp.layout_x;
+        info.layout_y = comp.layout_y;
+        info.is_server = comp.is_server;
+        info.is_connected = comp.is_connected;
+
+        auto data = serialize_packet(EventType::LAYOUT_UPDATE, info);
+        g_app.active_client.send(data);
+    }
+}
+
 void server_thread_func() {
     if (!g_app.input_capture.init()) {
         PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Failed to init input capture");
@@ -719,6 +749,9 @@ void server_thread_func() {
                     g_app.active_client.send(data);
                 }
 
+                // Send current layout to the new client
+                broadcast_layout_to_client();
+
                 static char conn_msg[256];
                 snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
@@ -913,6 +946,53 @@ void client_thread_func(std::string host, uint16_t port) {
                     PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"Client now RECEIVING input from server");
                     break;
                 }
+                case EventType::LAYOUT_UPDATE: {
+                    if (payload.size() < sizeof(ComputerLayoutInfo)) break;
+
+                    auto* info = (ComputerLayoutInfo*)payload.data();
+
+                    // Update layout with info from server
+                    {
+                        std::lock_guard<std::mutex> lock(g_app.layout_mutex);
+
+                        // Find this computer in our layout
+                        bool found = false;
+                        for (auto& comp : g_app.layout.computers) {
+                            if (comp.name == info->name) {
+                                // Update existing computer's layout
+                                comp.layout_x = info->layout_x;
+                                comp.layout_y = info->layout_y;
+                                comp.screen_width = info->screen_width;
+                                comp.screen_height = info->screen_height;
+                                comp.is_server = info->is_server;
+                                comp.is_connected = info->is_connected;
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        // If not found, add it to layout
+                        if (!found) {
+                            ComputerInfo comp;
+                            comp.name = info->name;
+                            comp.layout_x = info->layout_x;
+                            comp.layout_y = info->layout_y;
+                            comp.screen_width = info->screen_width;
+                            comp.screen_height = info->screen_height;
+                            comp.is_server = info->is_server;
+                            comp.is_connected = info->is_connected;
+                            comp.last_seen = GetTickCount();
+                            // IP and port will be filled in by discovery
+                            g_app.layout.computers.push_back(comp);
+                        }
+                    }
+
+                    // Refresh layout display
+                    if (g_app.hwnd_layout) {
+                        InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -1087,27 +1167,32 @@ LRESULT CALLBACK layout_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
-            
+
             int hit = hit_test_layout(x, y);
             g_app.layout.selected_index = hit;
-            
-            if (hit >= 0 && g_app.layout.computers[hit].name != g_app.computer_name) {
+
+            // Only allow dragging if we're running as server (server is authoritative for layout)
+            // Prevent dragging if connected as client since server controls layout
+            if (hit >= 0 &&
+                g_app.layout.computers[hit].name != g_app.computer_name &&
+                g_app.server_running &&
+                !g_app.client_connected) {
                 // Start dragging
                 g_app.layout.dragging = true;
                 SetCapture(hwnd);
-                
+
                 auto& comp = g_app.layout.computers[hit];
                 float scale = g_app.layout.scale;
                 int offset_x = g_app.layout.offset_x;
                 int offset_y = g_app.layout.offset_y;
-                
+
                 int screen_x = offset_x + (int)(comp.layout_x * scale);
                 int screen_y = offset_y + (int)(comp.layout_y * scale);
-                
+
                 g_app.layout.drag_offset.x = x - screen_x;
                 g_app.layout.drag_offset.y = y - screen_y;
             }
-            
+
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -1136,6 +1221,11 @@ LRESULT CALLBACK layout_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (g_app.layout.dragging) {
                 g_app.layout.dragging = false;
                 ReleaseCapture();
+
+                // Broadcast updated layout to connected client (if server is running)
+                if (g_app.server_running) {
+                    broadcast_layout_to_client();
+                }
             }
             return 0;
         }

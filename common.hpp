@@ -29,7 +29,8 @@ enum class EventType : uint8_t {
     CLIPBOARD = 6,
     KEEPALIVE = 7,
     SCREEN_INFO = 8,
-    SWITCH_SCREEN = 9
+    SWITCH_SCREEN = 9,
+    LAYOUT_UPDATE = 10
 };
 
 // Mouse buttons
@@ -99,6 +100,17 @@ struct ScreenInfo {
 struct SwitchScreenEvent {
     ScreenEdge edge;
     int32_t position;  // position along the edge
+};
+
+// Computer layout information (sent from server to clients)
+struct ComputerLayoutInfo {
+    char name[64];           // Computer name
+    int32_t screen_width;    // Screen resolution
+    int32_t screen_height;
+    int32_t layout_x;        // Position in virtual layout
+    int32_t layout_y;
+    bool is_server;          // True if this is the server computer
+    bool is_connected;       // Connection status
 };
 
 #pragma pack(pop)
