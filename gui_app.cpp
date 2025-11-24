@@ -555,8 +555,8 @@ void server_thread_func() {
                 if (has_client) {
                     // Toggle state
                     g_app.active_on_remote = !g_app.active_on_remote;
-                    g_app.manual_mode = g_app.active_on_remote;  // Set manual mode flag
                     bool new_state = g_app.active_on_remote;
+                    g_app.manual_mode = new_state;  // Set manual mode flag
 
                     if (new_state) {
                         // Get current cursor position to initialize virtual cursor
