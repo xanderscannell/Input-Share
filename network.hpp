@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include <string>
 #include <stdexcept>
+#include <chrono>
 
 namespace MouseShare {
 
@@ -47,6 +48,10 @@ public:
         // Enable TCP_NODELAY for low latency
         BOOL flag = TRUE;
         setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+        
+        // Set keepalive
+        BOOL keepalive = TRUE;
+        setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, (char*)&keepalive, sizeof(keepalive));
     }
     
     void bind(uint16_t port) {
@@ -82,10 +87,14 @@ public:
         BOOL flag = TRUE;
         setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
         
+        // Enable keepalive
+        BOOL keepalive = TRUE;
+        setsockopt(client_sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&keepalive, sizeof(keepalive));
+        
         return Socket(client_sock);
     }
     
-    void connect(const std::string& host, uint16_t port) {
+    void connect(const std::string& host, uint16_t port, int timeout_ms = 5000) {
         addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
@@ -96,10 +105,53 @@ public:
             throw NetworkError("Failed to resolve host: " + std::to_string(ret));
         }
         
-        if (::connect(sock_, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
-            freeaddrinfo(result);
-            throw NetworkError("Failed to connect: " + std::to_string(WSAGetLastError()));
+        // Set socket to non-blocking for timeout support
+        u_long mode = 1;
+        ioctlsocket(sock_, FIONBIO, &mode);
+        
+        // Attempt connection
+        int connect_result = ::connect(sock_, result->ai_addr, (int)result->ai_addrlen);
+        int error = WSAGetLastError();
+        
+        if (connect_result == SOCKET_ERROR) {
+            if (error == WSAEWOULDBLOCK) {
+                // Connection in progress - wait for completion
+                fd_set write_set, error_set;
+                FD_ZERO(&write_set);
+                FD_ZERO(&error_set);
+                FD_SET(sock_, &write_set);
+                FD_SET(sock_, &error_set);
+                
+                timeval tv;
+                tv.tv_sec = timeout_ms / 1000;
+                tv.tv_usec = (timeout_ms % 1000) * 1000;
+                
+                int select_result = select(0, nullptr, &write_set, &error_set, &tv);
+                
+                if (select_result == 0) {
+                    freeaddrinfo(result);
+                    throw NetworkError("Connection timeout");
+                } else if (select_result == SOCKET_ERROR || FD_ISSET(sock_, &error_set)) {
+                    freeaddrinfo(result);
+                    throw NetworkError("Connection failed: " + std::to_string(WSAGetLastError()));
+                }
+                
+                // Connection succeeded - check for errors
+                int optval;
+                int optlen = sizeof(optval);
+                if (getsockopt(sock_, SOL_SOCKET, SO_ERROR, (char*)&optval, &optlen) == SOCKET_ERROR || optval != 0) {
+                    freeaddrinfo(result);
+                    throw NetworkError("Connection failed: " + std::to_string(optval));
+                }
+            } else {
+                freeaddrinfo(result);
+                throw NetworkError("Failed to connect: " + std::to_string(error));
+            }
         }
+        
+        // Set back to blocking mode
+        mode = 0;
+        ioctlsocket(sock_, FIONBIO, &mode);
         
         freeaddrinfo(result);
     }
@@ -125,15 +177,27 @@ public:
         int received = 0;
         char* buf = static_cast<char*>(buffer);
         
+        auto start_time = std::chrono::steady_clock::now();
+        
         while (received < len) {
             if (timeout_ms >= 0) {
+                // Calculate remaining timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start_time
+                ).count();
+                
+                int remaining_timeout = timeout_ms - (int)elapsed;
+                if (remaining_timeout <= 0) {
+                    return false;
+                }
+                
                 fd_set readSet;
                 FD_ZERO(&readSet);
                 FD_SET(sock_, &readSet);
                 
                 timeval tv;
-                tv.tv_sec = timeout_ms / 1000;
-                tv.tv_usec = (timeout_ms % 1000) * 1000;
+                tv.tv_sec = remaining_timeout / 1000;
+                tv.tv_usec = (remaining_timeout % 1000) * 1000;
                 
                 int ret = select(0, &readSet, nullptr, nullptr, &tv);
                 if (ret <= 0) {
@@ -153,6 +217,8 @@ public:
     
     void close() {
         if (sock_ != INVALID_SOCKET) {
+            // Graceful shutdown
+            shutdown(sock_, SD_BOTH);
             closesocket(sock_);
             sock_ = INVALID_SOCKET;
         }

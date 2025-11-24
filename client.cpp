@@ -40,14 +40,27 @@ public:
             
             try {
                 socket_.create();
-                socket_.connect(server_host_, port_);
+                socket_.connect(server_host_, port_, 5000);  // 5 second timeout
                 connected_ = true;
+                last_data_received_ = std::chrono::steady_clock::now();
                 
                 std::cout << "Connected to server!\n";
                 
                 // Receive and process events
                 while (g_running && connected_) {
                     process_events();
+                    
+                    // Check for connection timeout (no data received for 30 seconds)
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_data_received_
+                    ).count();
+                    
+                    if (elapsed > 30) {
+                        std::cerr << "Connection timeout - no data received for 30 seconds\n";
+                        connected_ = false;
+                        break;
+                    }
                 }
                 
                 socket_.close();
@@ -80,43 +93,61 @@ private:
             return;
         }
         
-        // Verify protocol version
-        if (header.version != PROTOCOL_VERSION) {
-            std::cerr << "Protocol version mismatch\n";
+        // Update last received time
+        last_data_received_ = std::chrono::steady_clock::now();
+        
+        // Validate packet header
+        if (!is_valid_packet_header(header)) {
+            std::cerr << "Invalid packet header: version=" << header.version 
+                      << " size=" << header.payload_size << "\n";
             connected_ = false;
             return;
         }
         
-        // Read payload
+        // Read payload if present
         std::vector<char> payload(header.payload_size);
-        if (!socket_.recv_exact(payload.data(), header.payload_size)) {
-            connected_ = false;
-            return;
+        if (header.payload_size > 0) {
+            if (!socket_.recv_exact(payload.data(), header.payload_size)) {
+                connected_ = false;
+                return;
+            }
         }
         
         // Process based on event type
         switch (header.type) {
             case EventType::MOUSE_MOVE:
-                handle_mouse_move(payload.data());
+                if (payload.size() >= sizeof(MouseMoveEvent)) {
+                    handle_mouse_move(payload.data());
+                }
                 break;
             case EventType::MOUSE_BUTTON:
-                handle_mouse_button(payload.data());
+                if (payload.size() >= sizeof(MouseButtonEvent)) {
+                    handle_mouse_button(payload.data());
+                }
                 break;
             case EventType::MOUSE_SCROLL:
-                handle_mouse_scroll(payload.data());
+                if (payload.size() >= sizeof(MouseScrollEvent)) {
+                    handle_mouse_scroll(payload.data());
+                }
                 break;
             case EventType::KEY_PRESS:
             case EventType::KEY_RELEASE:
-                handle_key_event(payload.data(), header.type == EventType::KEY_PRESS);
+                if (payload.size() >= sizeof(KeyEvent)) {
+                    handle_key_event(payload.data(), header.type == EventType::KEY_PRESS);
+                }
                 break;
             case EventType::SCREEN_INFO:
-                handle_screen_info(payload.data());
+                if (payload.size() >= sizeof(ScreenInfo)) {
+                    handle_screen_info(payload.data());
+                }
                 break;
             case EventType::SWITCH_SCREEN:
-                handle_switch_screen(payload.data());
+                if (payload.size() >= sizeof(SwitchScreenEvent)) {
+                    handle_switch_screen(payload.data());
+                }
                 break;
             case EventType::KEEPALIVE:
-                // Just ignore keepalive
+                // Just acknowledge keepalive by updating last_data_received_
                 break;
             default:
                 std::cerr << "Unknown event type: " << static_cast<int>(header.type) << "\n";
@@ -234,6 +265,7 @@ private:
     }
     
     static int scale_position(int pos, int from_size, int to_size) {
+        if (from_size <= 0 || to_size <= 0) return 0;
         return (pos * to_size) / from_size;
     }
     
@@ -263,6 +295,8 @@ private:
     int server_height_ = 1080;
     
     ScreenEdge entry_edge_ = ScreenEdge::NONE;
+    
+    std::chrono::steady_clock::time_point last_data_received_;
 };
 
 void print_usage(const char* program) {

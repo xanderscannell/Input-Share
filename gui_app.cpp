@@ -37,6 +37,8 @@ using namespace MouseShare;
 
 constexpr int DISCOVERY_PORT = 24801;
 constexpr int DISCOVERY_INTERVAL_MS = 3000;
+constexpr int SNAP_THRESHOLD = 30;  // Pixels for snapping monitors together
+constexpr int EDGE_TOLERANCE = 30;  // Pixels tolerance for edge detection
 
 // Window IDs
 constexpr int ID_LISTVIEW_COMPUTERS = 101;
@@ -135,9 +137,13 @@ public:
     std::atomic<bool> active_on_remote{false};
     std::atomic<bool> manual_mode{false};  // Track if we're in manual toggle mode (vs automatic edge mode)
 
-    // Virtual cursor for server when controlling remote
-    int virtual_cursor_x = 0;
-    int virtual_cursor_y = 0;
+    // Keepalive tracking
+    std::chrono::steady_clock::time_point last_keepalive_sent;
+    std::chrono::steady_clock::time_point last_data_received;
+
+    // Virtual cursor for server when controlling remote (thread-safe)
+    std::atomic<int> virtual_cursor_x{0};
+    std::atomic<int> virtual_cursor_y{0};
 
     // This computer's info
     ComputerInfo local_info;
@@ -166,6 +172,27 @@ public:
         layout.scale = 0.1f;
         layout.offset_x = 50;
         layout.offset_y = 50;
+
+        // Initialize keepalive timestamps
+        last_keepalive_sent = std::chrono::steady_clock::now();
+        last_data_received = std::chrono::steady_clock::now();
+    }
+
+    void update_screen_dimensions() {
+        local_info.screen_width = GetSystemMetrics(SM_CXSCREEN);
+        local_info.screen_height = GetSystemMetrics(SM_CYSCREEN);
+        
+        std::lock_guard<std::mutex> lock(layout_mutex);
+        for (auto& comp : layout.computers) {
+            if (comp.name == computer_name) {
+                comp.screen_width = local_info.screen_width;
+                comp.screen_height = local_info.screen_height;
+                break;
+            }
+        }
+        
+        input_capture.update_screen_dimensions();
+        input_simulator.update_screen_dimensions();
     }
 };
 
@@ -196,7 +223,8 @@ void broadcast_presence() {
     packet.screen_height = g_app.local_info.screen_height;
     packet.is_server = g_app.server_running ? 1 : 0;
     strncpy_s(packet.name, g_app.computer_name.c_str(), sizeof(packet.name) - 1);
-    
+    packet.name[sizeof(packet.name) - 1] = '\0';  // Ensure null termination
+
     sockaddr_in broadcast_addr = {};
     broadcast_addr.sin_family = AF_INET;
     broadcast_addr.sin_port = htons(DISCOVERY_PORT);
@@ -231,15 +259,25 @@ void discovery_thread_func() {
         return;
     }
     
-    // Set non-blocking
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-    
+    // Set receive timeout
+    DWORD timeout = 100;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
     g_app.discovery_socket = Socket(sock);
-    
+
+    auto last_broadcast = std::chrono::steady_clock::now();
+
     while (g_app.discovery_running) {
-        // Broadcast our presence
-        broadcast_presence();
+        // Broadcast our presence every DISCOVERY_INTERVAL_MS
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_broadcast
+        ).count();
+
+        if (elapsed >= DISCOVERY_INTERVAL_MS) {
+            broadcast_presence();
+            last_broadcast = now;
+        }
         
         // Listen for others
         char buffer[512];
@@ -253,6 +291,8 @@ void discovery_thread_func() {
             
             if (received >= sizeof(DiscoveryPacket)) {
                 auto* packet = (DiscoveryPacket*)buffer;
+                // Null-terminate name to prevent buffer overflow
+                packet->name[sizeof(packet->name) - 1] = '\0';
                 if (memcmp(packet->magic, "MSHR", 4) == 0) {
                     // Get IP string
                     char ip_str[INET_ADDRSTRLEN];
@@ -320,14 +360,75 @@ void discovery_thread_func() {
                 g_app.layout.computers.end()
             );
         }
-        
-        Sleep(DISCOVERY_INTERVAL_MS);
+
+        Sleep(100);
     }
 }
 
 // ============================================================================
 // Server/Client Logic
 // ============================================================================
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Check if two monitors are aligned on an edge (with tolerance)
+bool are_monitors_aligned(const ComputerInfo& a, const ComputerInfo& b, ScreenEdge edge) {
+    switch (edge) {
+        case ScreenEdge::RIGHT:  // A's right edge to B's left edge
+            return abs(b.layout_x - (a.layout_x + a.screen_width)) <= EDGE_TOLERANCE &&
+                   b.layout_y < a.layout_y + a.screen_height &&
+                   b.layout_y + b.screen_height > a.layout_y;
+        case ScreenEdge::LEFT:  // A's left edge to B's right edge
+            return abs((b.layout_x + b.screen_width) - a.layout_x) <= EDGE_TOLERANCE &&
+                   b.layout_y < a.layout_y + a.screen_height &&
+                   b.layout_y + b.screen_height > a.layout_y;
+        case ScreenEdge::BOTTOM:  // A's bottom edge to B's top edge
+            return abs(b.layout_y - (a.layout_y + a.screen_height)) <= EDGE_TOLERANCE &&
+                   b.layout_x < a.layout_x + a.screen_width &&
+                   b.layout_x + b.screen_width > a.layout_x;
+        case ScreenEdge::TOP:  // A's top edge to B's bottom edge
+            return abs((b.layout_y + b.screen_height) - a.layout_y) <= EDGE_TOLERANCE &&
+                   b.layout_x < a.layout_x + a.screen_width &&
+                   b.layout_x + b.screen_width > a.layout_x;
+        default:
+            return false;
+    }
+}
+
+// Snap monitor position to nearby edges
+void snap_monitor_position(ComputerInfo& dragged, const ComputerInfo& target) {
+    // Try snapping to right edge
+    if (abs(dragged.layout_x - (target.layout_x + target.screen_width)) < SNAP_THRESHOLD) {
+        dragged.layout_x = target.layout_x + target.screen_width;
+    }
+
+    // Try snapping to left edge
+    if (abs((dragged.layout_x + dragged.screen_width) - target.layout_x) < SNAP_THRESHOLD) {
+        dragged.layout_x = target.layout_x - dragged.screen_width;
+    }
+
+    // Try snapping to bottom edge
+    if (abs(dragged.layout_y - (target.layout_y + target.screen_height)) < SNAP_THRESHOLD) {
+        dragged.layout_y = target.layout_y + target.screen_height;
+    }
+
+    // Try snapping to top edge
+    if (abs((dragged.layout_y + dragged.screen_height) - target.layout_y) < SNAP_THRESHOLD) {
+        dragged.layout_y = target.layout_y - dragged.screen_height;
+    }
+
+    // Try Y alignment
+    if (abs(dragged.layout_y - target.layout_y) < SNAP_THRESHOLD) {
+        dragged.layout_y = target.layout_y;
+    }
+
+    // Try X alignment
+    if (abs(dragged.layout_x - target.layout_x) < SNAP_THRESHOLD) {
+        dragged.layout_x = target.layout_x;
+    }
+}
 
 // Broadcast current layout to connected client
 void broadcast_layout_to_client() {
@@ -375,17 +476,21 @@ void server_thread_func() {
 
             if (g_app.active_on_remote) {
                 // Update virtual cursor position with the deltas we received
-                g_app.virtual_cursor_x += dx;
-                g_app.virtual_cursor_y += dy;
+                g_app.virtual_cursor_x = g_app.virtual_cursor_x.load() + dx;
+                g_app.virtual_cursor_y = g_app.virtual_cursor_y.load() + dy;
 
                 // Clamp virtual cursor to screen bounds for edge detection
-                g_app.virtual_cursor_x = (std::max)(0, (std::min)(g_app.virtual_cursor_x, g_app.local_info.screen_width - 1));
-                g_app.virtual_cursor_y = (std::max)(0, (std::min)(g_app.virtual_cursor_y, g_app.local_info.screen_height - 1));
+                int vx = g_app.virtual_cursor_x.load();
+                int vy = g_app.virtual_cursor_y.load();
+                vx = (std::max)(0, (std::min)(vx, g_app.local_info.screen_width - 1));
+                vy = (std::max)(0, (std::min)(vy, g_app.local_info.screen_height - 1));
+                g_app.virtual_cursor_x = vx;
+                g_app.virtual_cursor_y = vy;
 
                 // Send movement to client
                 MouseMoveEvent event;
-                event.x = g_app.virtual_cursor_x;
-                event.y = g_app.virtual_cursor_y;
+                event.x = vx;
+                event.y = vy;
                 event.dx = dx;  // Real delta from Windows!
                 event.dy = dy;
                 auto data = serialize_packet(EventType::MOUSE_MOVE, event);
@@ -410,16 +515,16 @@ void server_thread_func() {
                     bool at_edge = false;
                     ScreenEdge edge = ScreenEdge::NONE;
 
-                    if (g_app.virtual_cursor_x <= 0) {
+                    if (vx <= 0) {
                         at_edge = true;
                         edge = ScreenEdge::LEFT;
-                    } else if (g_app.virtual_cursor_x >= g_app.local_info.screen_width - 1) {
+                    } else if (vx >= g_app.local_info.screen_width - 1) {
                         at_edge = true;
                         edge = ScreenEdge::RIGHT;
-                    } else if (g_app.virtual_cursor_y <= 0) {
+                    } else if (vy <= 0) {
                         at_edge = true;
                         edge = ScreenEdge::TOP;
-                    } else if (g_app.virtual_cursor_y >= g_app.local_info.screen_height - 1) {
+                    } else if (vy >= g_app.local_info.screen_height - 1) {
                         at_edge = true;
                         edge = ScreenEdge::BOTTOM;
                     }
@@ -438,72 +543,58 @@ void server_thread_func() {
             ScreenEdge edge = ScreenEdge::NONE;
             int edge_position = 0;
 
-            // Find if we're at an edge that connects to another computer
+            // Copy layout info with lock to avoid race condition
+            int local_x, local_y, local_w, local_h;
+            std::vector<ComputerInfo> layout_copy;
             {
                 std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
+                local_x = g_app.local_info.layout_x;
+                local_y = g_app.local_info.layout_y;
+                local_w = g_app.local_info.screen_width;
+                local_h = g_app.local_info.screen_height;
+                layout_copy = g_app.layout.computers;
+            }
 
-                // Check all edges
-                if (x <= 0) {
-                    at_edge = true;
-                    edge = ScreenEdge::LEFT;
-                    edge_position = y;
-                } else if (x >= g_app.local_info.screen_width - 1) {
-                    at_edge = true;
-                    edge = ScreenEdge::RIGHT;
-                    edge_position = y;
-                } else if (y <= 0) {
-                    at_edge = true;
-                    edge = ScreenEdge::TOP;
-                    edge_position = x;
-                } else if (y >= g_app.local_info.screen_height - 1) {
-                    at_edge = true;
-                    edge = ScreenEdge::BOTTOM;
-                    edge_position = x;
+            // Check all edges
+            if (x <= 0) {
+                at_edge = true;
+                edge = ScreenEdge::LEFT;
+                edge_position = y;
+            } else if (x >= local_w - 1) {
+                at_edge = true;
+                edge = ScreenEdge::RIGHT;
+                edge_position = y;
+            } else if (y <= 0) {
+                at_edge = true;
+                edge = ScreenEdge::TOP;
+                edge_position = x;
+            } else if (y >= local_h - 1) {
+                at_edge = true;
+                edge = ScreenEdge::BOTTOM;
+                edge_position = x;
+            }
+
+            // Verify there's a computer at this edge in the layout
+            if (at_edge) {
+                bool found_neighbor = false;
+                ComputerInfo local_info_copy = g_app.local_info;
+                local_info_copy.layout_x = local_x;
+                local_info_copy.layout_y = local_y;
+                local_info_copy.screen_width = local_w;
+                local_info_copy.screen_height = local_h;
+                
+                for (const auto& comp : layout_copy) {
+                    if (comp.name == g_app.computer_name) continue;
+                    if (!comp.is_connected) continue;
+
+                    if (are_monitors_aligned(local_info_copy, comp, edge)) {
+                        found_neighbor = true;
+                        break;
+                    }
                 }
 
-                // Verify there's a computer at this edge in the layout
-                if (at_edge) {
-                    bool found_neighbor = false;
-                    for (const auto& comp : g_app.layout.computers) {
-                        if (comp.name == g_app.computer_name) continue;
-                        if (!comp.is_connected) continue;
-
-                        // Check if computer is positioned at this edge
-                        int local_x = g_app.local_info.layout_x;
-                        int local_y = g_app.local_info.layout_y;
-                        int local_w = g_app.local_info.screen_width;
-                        int local_h = g_app.local_info.screen_height;
-
-                        if (edge == ScreenEdge::RIGHT &&
-                            comp.layout_x == local_x + local_w &&
-                            comp.layout_y <= local_y + edge_position &&
-                            comp.layout_y + comp.screen_height > local_y + edge_position) {
-                            found_neighbor = true;
-                            break;
-                        } else if (edge == ScreenEdge::LEFT &&
-                            comp.layout_x + comp.screen_width == local_x &&
-                            comp.layout_y <= local_y + edge_position &&
-                            comp.layout_y + comp.screen_height > local_y + edge_position) {
-                            found_neighbor = true;
-                            break;
-                        } else if (edge == ScreenEdge::BOTTOM &&
-                            comp.layout_y == local_y + local_h &&
-                            comp.layout_x <= local_x + edge_position &&
-                            comp.layout_x + comp.screen_width > local_x + edge_position) {
-                            found_neighbor = true;
-                            break;
-                        } else if (edge == ScreenEdge::TOP &&
-                            comp.layout_y + comp.screen_height == local_y &&
-                            comp.layout_x <= local_x + edge_position &&
-                            comp.layout_x + comp.screen_width > local_x + edge_position) {
-                            found_neighbor = true;
-                            break;
-                        }
-                    }
-
-                    if (!found_neighbor) {
-                        at_edge = false;
-                    }
+                if (!found_neighbor) {
+                    at_edge = false;
                 }
             }
 
@@ -580,7 +671,6 @@ void server_thread_func() {
         [](uint32_t vk, uint32_t scan, uint32_t flags, bool pressed) {
             // F8 to manually toggle input control (for testing)
             if (vk == VK_F8 && pressed) {
-                // Check if client exists first (without holding lock)
                 bool has_client = g_app.active_client.is_valid();
                 if (has_client) {
                     // Toggle state
@@ -592,38 +682,21 @@ void server_thread_func() {
                         // Get current cursor position to initialize virtual cursor
                         POINT pt;
                         GetCursorPos(&pt);
-                        // GetCursorPos returns screen coordinates, which is what we need
                         g_app.virtual_cursor_x = pt.x;
                         g_app.virtual_cursor_y = pt.y;
 
                         // Now capture input to block local cursor
                         g_app.input_capture.capture_input(true);
                     } else {
-                        // Release capture
+                        // Release capture and move cursor to center
                         g_app.input_capture.capture_input(false);
+                        int center_x = g_app.local_info.screen_width / 2;
+                        int center_y = g_app.local_info.screen_height / 2;
+                        g_app.input_capture.warp_cursor(center_x, center_y);
                     }
-
-                    // Check if we have a connected neighbor for diagnostics
-                    int connected_count = 0;
-                    {
-                        std::lock_guard<std::mutex> layout_lock(g_app.layout_mutex);
-                        for (const auto& comp : g_app.layout.computers) {
-                            if (comp.name != g_app.computer_name && comp.is_connected) {
-                                connected_count++;
-                            }
-                        }
-                    }
-
-                    static char msg[256];
-                    if (new_state) {
-                        snprintf(msg, sizeof(msg), "F8: REMOTE control - Virtual cursor active, real dx/dy sent (%d connected)", connected_count);
-                    } else {
-                        snprintf(msg, sizeof(msg), "F8: LOCAL control - Cursor released");
-                    }
-                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)msg);
 
                     if (new_state) {
-                        // Send switch event to remote - lock only for sending
+                        // Send switch event to remote
                         SwitchScreenEvent event;
                         event.edge = ScreenEdge::LEFT;
                         event.position = GetSystemMetrics(SM_CYSCREEN) / 2;
@@ -633,14 +706,14 @@ void server_thread_func() {
                         if (g_app.active_client.is_valid()) {
                             int sent = g_app.active_client.send(data);
                             if (sent <= 0) {
-                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Failed to send SWITCH_SCREEN to client!");
                                 g_app.input_capture.capture_input(false);
                                 g_app.active_on_remote = false;
-                            } else {
-                                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"F8: Input captured! Move mouse to send to client.");
                             }
                         }
                     }
+                    
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, 
+                               (LPARAM)(new_state ? "F8: Controlling REMOTE" : "F8: Controlling LOCAL"));
                 }
                 return;
             }
@@ -649,9 +722,14 @@ void server_thread_func() {
             if (vk == VK_SCROLL && pressed) {
                 if (g_app.active_on_remote) {
                     g_app.active_on_remote = false;
-                    g_app.manual_mode = false;  // Clear manual mode
+                    g_app.manual_mode = false;
                     g_app.input_capture.capture_input(false);
-                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"ScrollLock: Switched to LOCAL control");
+                    // Move cursor to center
+                    int center_x = g_app.local_info.screen_width / 2;
+                    int center_y = g_app.local_info.screen_height / 2;
+                    g_app.input_capture.warp_cursor(center_x, center_y);
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, 
+                               (LPARAM)"ScrollLock: Switched to LOCAL");
                 }
                 return;
             }
@@ -753,18 +831,44 @@ void server_thread_func() {
                 broadcast_layout_to_client();
 
                 static char conn_msg[256];
-                snprintf(conn_msg, sizeof(conn_msg), "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
+                snprintf(conn_msg, sizeof(conn_msg), 
+                        "CLIENT CONNECTED from %s! Press F8 to toggle control", client_ip);
                 PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)conn_msg);
 
-                // Keep connection alive and monitor for disconnect
+                g_app.last_keepalive_sent = std::chrono::steady_clock::now();
+
+                // Keep connection alive and send keepalive
                 while (g_app.server_running) {
                     {
                         std::lock_guard<std::mutex> lock(g_app.active_client_mutex);
                         if (!g_app.active_client.is_valid() || !g_app.active_client.is_connected()) {
                             break;
                         }
+                        
+                        // Send keepalive every 5 seconds
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - g_app.last_keepalive_sent
+                        ).count();
+                        
+                        if (elapsed >= 5) {
+                            auto data = serialize_keepalive();
+                            if (g_app.active_client.send(data) <= 0) {
+                                break;
+                            }
+                            g_app.last_keepalive_sent = now;
+                        }
                     }
                     Sleep(100);
+                }
+
+                // Clean disconnect handling
+                if (g_app.active_on_remote) {
+                    g_app.active_on_remote = false;
+                    g_app.input_capture.capture_input(false);
+                    // Move cursor to center to prevent retrigger
+                    g_app.input_capture.warp_cursor(g_app.local_info.screen_width / 2, 
+                                                    g_app.local_info.screen_height / 2);
                 }
 
                 // Mark client as disconnected
@@ -803,9 +907,10 @@ void client_thread_func(std::string host, uint16_t port) {
     
     try {
         g_app.client_socket.create();
-        g_app.client_socket.connect(host, port);
+        g_app.client_socket.connect(host, port, 5000);  // 5 second timeout
         g_app.client_connected = true;
         g_app.connected_to = host;
+        g_app.last_data_received = std::chrono::steady_clock::now();
         
         PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, (LPARAM)"CONNECTED TO SERVER! Press F8 to toggle control, or move mouse to screen edge");
         
@@ -817,7 +922,27 @@ void client_thread_func(std::string host, uint16_t port) {
         while (g_app.client_connected) {
             PacketHeader header;
             if (!g_app.client_socket.recv_exact(&header, sizeof(header), 100)) {
+                // Check timeout
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - g_app.last_data_received
+                ).count();
+                
+                if (elapsed > 30) {
+                    PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, 
+                               (LPARAM)"Connection timeout - no data for 30 seconds");
+                    break;
+                }
                 continue;
+            }
+
+            g_app.last_data_received = std::chrono::steady_clock::now();
+
+            // Validate packet
+            if (!is_valid_packet_header(header)) {
+                PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, 
+                           (LPARAM)"Invalid packet received");
+                break;
             }
 
             // Validate packet size (prevent crashes from malformed packets)
@@ -1037,6 +1162,82 @@ void draw_layout(HDC hdc, RECT& rect) {
     float scale = g_app.layout.scale;
     int offset_x = g_app.layout.offset_x;
     int offset_y = g_app.layout.offset_y;
+
+    // Find local computer for edge indicators
+    const ComputerInfo* local = nullptr;
+    for (const auto& comp : g_app.layout.computers) {
+        if (comp.name == g_app.computer_name) {
+            local = &comp;
+            break;
+        }
+    }
+
+    // Draw connection indicators for aligned edges (green lines)
+    if (local) {
+        for (const auto& comp : g_app.layout.computers) {
+            if (comp.name == g_app.computer_name || !comp.is_connected) continue;
+            
+            // Check right edge
+            if (are_monitors_aligned(*local, comp, ScreenEdge::RIGHT)) {
+                int x = offset_x + (int)((local->layout_x + local->screen_width) * scale);
+                int y1 = offset_y + (int)((std::max)(local->layout_y, comp.layout_y) * scale);
+                int y2 = offset_y + (int)((std::min)(local->layout_y + local->screen_height, 
+                                                      comp.layout_y + comp.screen_height) * scale);
+                
+                HPEN green_pen = CreatePen(PS_SOLID, 4, RGB(0, 255, 0));
+                HPEN old = (HPEN)SelectObject(hdc, green_pen);
+                MoveToEx(hdc, x, y1, nullptr);
+                LineTo(hdc, x, y2);
+                SelectObject(hdc, old);
+                DeleteObject(green_pen);
+            }
+            
+            // Check left edge
+            if (are_monitors_aligned(*local, comp, ScreenEdge::LEFT)) {
+                int x = offset_x + (int)(local->layout_x * scale);
+                int y1 = offset_y + (int)((std::max)(local->layout_y, comp.layout_y) * scale);
+                int y2 = offset_y + (int)((std::min)(local->layout_y + local->screen_height, 
+                                                      comp.layout_y + comp.screen_height) * scale);
+                
+                HPEN green_pen = CreatePen(PS_SOLID, 4, RGB(0, 255, 0));
+                HPEN old = (HPEN)SelectObject(hdc, green_pen);
+                MoveToEx(hdc, x, y1, nullptr);
+                LineTo(hdc, x, y2);
+                SelectObject(hdc, old);
+                DeleteObject(green_pen);
+            }
+            
+            // Check bottom edge
+            if (are_monitors_aligned(*local, comp, ScreenEdge::BOTTOM)) {
+                int y = offset_y + (int)((local->layout_y + local->screen_height) * scale);
+                int x1 = offset_x + (int)((std::max)(local->layout_x, comp.layout_x) * scale);
+                int x2 = offset_x + (int)((std::min)(local->layout_x + local->screen_width, 
+                                                      comp.layout_x + comp.screen_width) * scale);
+                
+                HPEN green_pen = CreatePen(PS_SOLID, 4, RGB(0, 255, 0));
+                HPEN old = (HPEN)SelectObject(hdc, green_pen);
+                MoveToEx(hdc, x1, y, nullptr);
+                LineTo(hdc, x2, y);
+                SelectObject(hdc, old);
+                DeleteObject(green_pen);
+            }
+            
+            // Check top edge
+            if (are_monitors_aligned(*local, comp, ScreenEdge::TOP)) {
+                int y = offset_y + (int)(local->layout_y * scale);
+                int x1 = offset_x + (int)((std::max)(local->layout_x, comp.layout_x) * scale);
+                int x2 = offset_x + (int)((std::min)(local->layout_x + local->screen_width, 
+                                                      comp.layout_x + comp.screen_width) * scale);
+                
+                HPEN green_pen = CreatePen(PS_SOLID, 4, RGB(0, 255, 0));
+                HPEN old = (HPEN)SelectObject(hdc, green_pen);
+                MoveToEx(hdc, x1, y, nullptr);
+                LineTo(hdc, x2, y);
+                SelectObject(hdc, old);
+                DeleteObject(green_pen);
+            }
+        }
+    }
     
     // Draw each computer's screen
     for (size_t i = 0; i < g_app.layout.computers.size(); i++) {
@@ -1095,7 +1296,7 @@ void draw_layout(HDC hdc, RECT& rect) {
     
     // Instructions
     SetTextColor(hdc, RGB(100, 100, 100));
-    std::string instructions = "Drag monitors to arrange. ";
+    std::string instructions = "Drag monitors to arrange (green lines = aligned edges). ";
     if (g_app.server_running || g_app.client_connected) {
         instructions += "Press F8 to manually toggle control. ";
     }
@@ -1171,12 +1372,8 @@ LRESULT CALLBACK layout_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             int hit = hit_test_layout(x, y);
             g_app.layout.selected_index = hit;
 
-            // Only allow dragging if we're running as server (server is authoritative for layout)
-            // Prevent dragging if connected as client since server controls layout
-            if (hit >= 0 &&
-                g_app.layout.computers[hit].name != g_app.computer_name &&
-                g_app.server_running &&
-                !g_app.client_connected) {
+            // Allow dragging ANY computer (removed name check)
+            if (hit >= 0) {
                 // Start dragging
                 g_app.layout.dragging = true;
                 SetCapture(hwnd);
@@ -1212,6 +1409,19 @@ LRESULT CALLBACK layout_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 comp.layout_x = (int)((x - g_app.layout.drag_offset.x - offset_x) / scale);
                 comp.layout_y = (int)((y - g_app.layout.drag_offset.y - offset_y) / scale);
                 
+                // Apply snapping to all other computers
+                for (const auto& target : g_app.layout.computers) {
+                    if (&target != &comp) {
+                        snap_monitor_position(comp, target);
+                    }
+                }
+
+                // Update local_info if we dragged the local computer
+                if (comp.name == g_app.computer_name) {
+                    g_app.local_info.layout_x = comp.layout_x;
+                    g_app.local_info.layout_y = comp.layout_y;
+                }
+
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
@@ -1252,6 +1462,14 @@ LRESULT CALLBACK layout_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_DISPLAYCHANGE: {
+            g_app.update_screen_dimensions();
+            InvalidateRect(g_app.hwnd_layout, nullptr, FALSE);
+            PostMessage(g_app.hwnd_main, WM_UPDATE_STATUS, 0, 
+                       (LPARAM)"Screen resolution changed - layout updated");
+            return 0;
+        }
+
         case WM_CREATE: {
             // Create layout panel
             WNDCLASSA layout_class = {};

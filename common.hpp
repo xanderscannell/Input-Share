@@ -18,6 +18,7 @@ namespace MouseShare {
 // Protocol version
 constexpr uint16_t PROTOCOL_VERSION = 1;
 constexpr uint16_t DEFAULT_PORT = 24800;
+constexpr uint16_t MAX_PAYLOAD_SIZE = 65535;  // Max reasonable packet size
 
 // Event types
 enum class EventType : uint8_t {
@@ -29,8 +30,7 @@ enum class EventType : uint8_t {
     CLIPBOARD = 6,
     KEEPALIVE = 7,
     SCREEN_INFO = 8,
-    SWITCH_SCREEN = 9,
-    LAYOUT_UPDATE = 10
+    SWITCH_SCREEN = 9
 };
 
 // Mouse buttons
@@ -102,17 +102,6 @@ struct SwitchScreenEvent {
     int32_t position;  // position along the edge
 };
 
-// Computer layout information (sent from server to clients)
-struct ComputerLayoutInfo {
-    char name[64];           // Computer name
-    int32_t screen_width;    // Screen resolution
-    int32_t screen_height;
-    int32_t layout_x;        // Position in virtual layout
-    int32_t layout_y;
-    bool is_server;          // True if this is the server computer
-    bool is_connected;       // Connection status
-};
-
 #pragma pack(pop)
 
 // Helper to get current timestamp in milliseconds
@@ -122,6 +111,13 @@ inline uint32_t get_timestamp() {
         now.time_since_epoch()
     );
     return static_cast<uint32_t>(ms.count());
+}
+
+// Validate packet header
+inline bool is_valid_packet_header(const PacketHeader& header) {
+    if (header.version != PROTOCOL_VERSION) return false;
+    if (header.payload_size > MAX_PAYLOAD_SIZE) return false;
+    return true;
 }
 
 // Serialize packet to buffer
@@ -138,6 +134,21 @@ std::string serialize_packet(EventType type, const T& payload) {
     
     std::memcpy(buffer.data(), &header, sizeof(header));
     std::memcpy(buffer.data() + sizeof(header), &payload, sizeof(T));
+    
+    return buffer;
+}
+
+// Serialize empty packet (for keepalive)
+inline std::string serialize_keepalive() {
+    PacketHeader header;
+    header.version = PROTOCOL_VERSION;
+    header.type = EventType::KEEPALIVE;
+    header.timestamp = get_timestamp();
+    header.payload_size = 0;
+    
+    std::string buffer;
+    buffer.resize(sizeof(PacketHeader));
+    std::memcpy(buffer.data(), &header, sizeof(header));
     
     return buffer;
 }

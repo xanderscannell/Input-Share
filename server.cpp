@@ -55,6 +55,7 @@ public:
             try {
                 client_socket_ = socket_.accept();
                 connected_ = true;
+                last_keepalive_sent_ = std::chrono::steady_clock::now();
                 
                 std::cout << "Client connected!\n";
                 
@@ -63,7 +64,31 @@ public:
                 
                 // Main loop while client is connected
                 while (g_running && connected_) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    // Send keepalive every 5 seconds
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_keepalive_sent_
+                    ).count();
+                    
+                    if (elapsed >= 5) {
+                        auto data = serialize_keepalive();
+                        if (client_socket_.send(data) <= 0) {
+                            connected_ = false;
+                            break;
+                        }
+                        last_keepalive_sent_ = now;
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                
+                // Clean disconnect handling
+                if (active_on_client_) {
+                    std::cout << "Client disconnected while active - releasing input\n";
+                    switch_to_server();
+                    
+                    // Move cursor to center to prevent immediate retrigger
+                    input_.warp_cursor(input_.screen_width() / 2, input_.screen_height() / 2);
                 }
                 
                 client_socket_.close();
@@ -178,26 +203,8 @@ private:
         event.position = edge_position;
         send_event(EventType::SWITCH_SCREEN, event);
         
-        // Move cursor away from edge
-        int x, y;
-        input_.get_cursor_position(x, y);
-        
-        switch (switch_edge_) {
-            case ScreenEdge::LEFT:
-                input_.warp_cursor(input_.screen_width() / 2, y);
-                break;
-            case ScreenEdge::RIGHT:
-                input_.warp_cursor(input_.screen_width() / 2, y);
-                break;
-            case ScreenEdge::TOP:
-                input_.warp_cursor(x, input_.screen_height() / 2);
-                break;
-            case ScreenEdge::BOTTOM:
-                input_.warp_cursor(x, input_.screen_height() / 2);
-                break;
-            default:
-                break;
-        }
+        // Move cursor away from edge to center
+        input_.warp_cursor(input_.screen_width() / 2, input_.screen_height() / 2);
     }
     
     void switch_to_server() {
@@ -217,6 +224,10 @@ private:
         
         if (sent <= 0) {
             connected_ = false;
+            if (active_on_client_) {
+                std::cout << "Send failed - switching back to server\n";
+                switch_to_server();
+            }
         }
     }
     
@@ -258,6 +269,8 @@ private:
     
     std::atomic<bool> connected_{false};
     std::atomic<bool> active_on_client_{false};
+    
+    std::chrono::steady_clock::time_point last_keepalive_sent_;
 };
 
 void print_usage(const char* program) {

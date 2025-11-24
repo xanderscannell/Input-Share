@@ -4,6 +4,7 @@
 #include <functional>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <iostream>
 
 namespace MouseShare {
@@ -17,12 +18,20 @@ public:
     using KeyCallback = std::function<void(uint32_t vkCode, uint32_t scanCode, uint32_t flags, bool pressed)>;
     
     InputCapture() : running_(false), captured_(false) {
+        // Thread-safe singleton assignment
+        std::lock_guard<std::mutex> lock(instance_mutex_);
+        if (instance_ != nullptr) {
+            std::cerr << "WARNING: Multiple InputCapture instances created!\n";
+        }
         instance_ = this;
     }
     
     ~InputCapture() {
         stop();
-        instance_ = nullptr;
+        std::lock_guard<std::mutex> lock(instance_mutex_);
+        if (instance_ == this) {
+            instance_ = nullptr;
+        }
     }
     
     bool init() {
@@ -39,6 +48,11 @@ public:
         return true;
     }
     
+    void update_screen_dimensions() {
+        screen_width_ = GetSystemMetrics(SM_CXSCREEN);
+        screen_height_ = GetSystemMetrics(SM_CYSCREEN);
+    }
+    
     void set_callbacks(MouseMoveCallback move_cb,
                       MouseButtonCallback button_cb,
                       MouseScrollCallback scroll_cb,
@@ -51,22 +65,54 @@ public:
     
     void start() {
         running_ = true;
+        hook_ready_ = false;
         hook_thread_ = std::thread(&InputCapture::hook_thread_func, this);
+        
+        // Wait for hook thread to be ready (max 5 seconds)
+        for (int i = 0; i < 50 && !hook_ready_; i++) {
+            Sleep(100);
+        }
+        
+        if (!hook_ready_) {
+            std::cerr << "WARNING: Hook thread initialization timeout\n";
+        }
     }
     
     void stop() {
         running_ = false;
         captured_ = false;  // Always release on stop
+        
         if (hook_thread_.joinable()) {
-            // Post quit message to hook thread
-            PostThreadMessage(hook_thread_id_, WM_QUIT, 0, 0);
-            hook_thread_.join();
+            // Signal thread to exit
+            if (hook_thread_id_ != 0) {
+                PostThreadMessage(hook_thread_id_, WM_QUIT, 0, 0);
+            }
+            
+            // Wait with timeout
+            auto start = std::chrono::steady_clock::now();
+            while (hook_thread_.joinable()) {
+                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) {
+                    std::cerr << "WARNING: Hook thread did not exit cleanly\n";
+                    break;
+                }
+                Sleep(10);
+            }
+            
+            if (hook_thread_.joinable()) {
+                hook_thread_.detach();  // Last resort
+            }
         }
     }
     
     void capture_input(bool capture) {
-        captured_ = capture;
-        if (capture) {
+        bool was_captured = captured_.exchange(capture);
+        
+        if (capture && !was_captured) {
+            // Just started capturing - update last position to current to avoid jumps
+            POINT pt;
+            GetCursorPos(&pt);
+            last_x_ = pt.x;
+            last_y_ = pt.y;
             last_activity_ = GetTickCount();
         }
     }
@@ -99,6 +145,7 @@ private:
         mouse_hook_ = SetWindowsHookEx(WH_MOUSE_LL, mouse_hook_proc, nullptr, 0);
         if (!mouse_hook_) {
             std::cerr << "Failed to install mouse hook: " << GetLastError() << "\n";
+            hook_ready_ = true;  // Signal ready even on failure
             return;
         }
         
@@ -107,8 +154,12 @@ private:
         if (!keyboard_hook_) {
             std::cerr << "Failed to install keyboard hook: " << GetLastError() << "\n";
             UnhookWindowsHookEx(mouse_hook_);
+            hook_ready_ = true;  // Signal ready even on failure
             return;
         }
+        
+        // Signal that hooks are installed
+        hook_ready_ = true;
         
         // Message loop for hooks
         MSG msg;
@@ -127,8 +178,14 @@ private:
         }
         
         // Cleanup hooks
-        UnhookWindowsHookEx(mouse_hook_);
-        UnhookWindowsHookEx(keyboard_hook_);
+        if (mouse_hook_) {
+            UnhookWindowsHookEx(mouse_hook_);
+            mouse_hook_ = nullptr;
+        }
+        if (keyboard_hook_) {
+            UnhookWindowsHookEx(keyboard_hook_);
+            keyboard_hook_ = nullptr;
+        }
     }
     
     static bool is_emergency_key(DWORD vkCode, bool ctrl_down, bool alt_down) {
@@ -164,7 +221,10 @@ private:
     }
     
     static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
-        if (nCode >= 0 && instance_) {
+        if (nCode >= 0) {
+            std::lock_guard<std::mutex> lock(instance_mutex_);
+            if (!instance_) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            
             auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
             
             // Update activity timestamp
@@ -176,16 +236,13 @@ private:
                 case WM_MOUSEMOVE: {
                     int dx = ms->pt.x - instance_->last_x_;
                     int dy = ms->pt.y - instance_->last_y_;
+                    
+                    // ALWAYS update last position to prevent jumps when capture is released
+                    instance_->last_x_ = ms->pt.x;
+                    instance_->last_y_ = ms->pt.y;
 
                     if (instance_->move_callback_ && (dx != 0 || dy != 0)) {
                         instance_->move_callback_(ms->pt.x, ms->pt.y, dx, dy);
-                    }
-
-                    // Only update last position if we're NOT blocking the event
-                    // If captured, cursor won't actually move, so keep last position as-is
-                    if (!instance_->captured_) {
-                        instance_->last_x_ = ms->pt.x;
-                        instance_->last_y_ = ms->pt.y;
                     }
                     break;
                 }
@@ -257,7 +314,10 @@ private:
     }
     
     static LRESULT CALLBACK keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
-        if (nCode >= 0 && instance_) {
+        if (nCode >= 0) {
+            std::lock_guard<std::mutex> lock(instance_mutex_);
+            if (!instance_) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            
             auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
             bool pressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
             
@@ -306,14 +366,16 @@ private:
     }
     
     static InputCapture* instance_;
+    static std::mutex instance_mutex_;
     
-    int screen_width_ = 0;
-    int screen_height_ = 0;
+    std::atomic<int> screen_width_{0};
+    std::atomic<int> screen_height_{0};
     int last_x_ = 0;
     int last_y_ = 0;
     
     std::atomic<bool> running_;
     std::atomic<bool> captured_;
+    std::atomic<bool> hook_ready_{false};
     std::thread hook_thread_;
     DWORD hook_thread_id_ = 0;
     DWORD last_activity_ = 0;
@@ -329,5 +391,6 @@ private:
 
 // Static member initialization
 InputCapture* InputCapture::instance_ = nullptr;
+std::mutex InputCapture::instance_mutex_;
 
 } // namespace MouseShare

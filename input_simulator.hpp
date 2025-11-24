@@ -13,9 +13,7 @@ public:
     ~InputSimulator() {}
     
     bool init() {
-        // Get screen dimensions
-        screen_width_ = GetSystemMetrics(SM_CXSCREEN);
-        screen_height_ = GetSystemMetrics(SM_CYSCREEN);
+        update_screen_dimensions();
         
         // Get initial cursor position
         POINT pt;
@@ -24,6 +22,11 @@ public:
         current_y_ = pt.y;
         
         return true;
+    }
+    
+    void update_screen_dimensions() {
+        screen_width_ = GetSystemMetrics(SM_CXSCREEN);
+        screen_height_ = GetSystemMetrics(SM_CYSCREEN);
     }
     
     void move_mouse(int x, int y) {
